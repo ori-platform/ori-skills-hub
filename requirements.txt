@@ -1,0 +1,10 @@
+#
+# This file is compiled from requirements.in.
+# Update requirements.in, then regenerate this file with:
+#
+#    pip-compile --output-file=requirements.txt requirements.in
+#
+fastapi==0.116.1
+uvicorn==0.35.0
+cryptography==46.0.7
+pyyaml==6.0.2

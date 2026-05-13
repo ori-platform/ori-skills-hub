@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ori-skills-hub"
+version = "0.1.0"
+description = "Community skill registry for the Ori platform"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Ori Nexus Systems LTD" }]
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn>=0.27",
+  "cryptography>=46.0",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "ruff>=0.15",
+  "mypy>=1.8",
+  "pre-commit>=3.7",
+]
+
+[tool.setuptools.packages.find]
+include = ["hub*"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["hub"]

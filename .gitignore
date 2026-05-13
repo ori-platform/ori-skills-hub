@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+.env
+.venv/
+dist/
+build/
+*.egg-info/
+.hub-data/
+.DS_Store
+.claude/
+ori_skills_hub.egg-info/

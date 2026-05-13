@@ -1,0 +1,33 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.2
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: apache-license-header
+        name: Apache-2.0 license header
+        entry: python scripts/check_license_headers.py
+        language: system
+        files: ^(hub|tests)/.*\.py$
+
+      - id: dependency-alignment
+        name: Dependency alignment
+        entry: python scripts/check_dependency_alignment.py
+        language: system
+        pass_filenames: false
+        files: ^(pyproject\.toml|requirements.*\.(in|txt))$
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: no-commit-to-branch
+        args: [--branch, main]
