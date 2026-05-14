@@ -6,22 +6,62 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+  id-token: none
+
 jobs:
   test:
+    name: Test (Python 3.12)
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Harden runner
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2
         with:
-          python-version: "3.11"
-      - name: Install
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Guard supply-chain invariants
+        run: python scripts/check_workflows.py
+
+      - name: Install hash-locked dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements-dev.txt
+          python -m pip install --require-hashes -r requirements-dev.txt
           python -m pip install --no-deps -e .
+
       - name: Pre-commit
         run: SKIP=no-commit-to-branch pre-commit run --show-diff-on-failure --all-files
+
       - name: Tests
         run: pytest -q
+
       - name: Type check
         run: mypy hub
+
+      - name: Audit pinned Python dependencies
+        run: |
+          python -m pip_audit -r requirements.txt
+          python -m pip_audit -r requirements-dev.txt
+
+      - name: Generate SBOM
+        run: |
+          python -m cyclonedx_py requirements requirements.txt \
+            --pyproject pyproject.toml \
+            --output-reproducible \
+            --of JSON \
+            -o sbom-hub.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom-hub
+          path: sbom-hub.json
+          if-no-files-found: error
