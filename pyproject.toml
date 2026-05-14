@@ -11,7 +11,7 @@ requires-python = ">=3.11,<3.13"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Ori Nexus Systems LTD" }]
 dependencies = [
-  "fastapi>=0.110",
+  "fastapi>=0.117",
   "uvicorn>=0.27",
   "cryptography>=46.0",
   "pyyaml>=6.0",
@@ -23,6 +23,8 @@ dev = [
   "ruff>=0.15",
   "mypy>=1.8",
   "pre-commit>=3.7",
+  "pip-audit>=2.7",
+  "cyclonedx-bom>=4.0",
 ]
 
 [tool.setuptools.packages.find]
