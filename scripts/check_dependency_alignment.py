@@ -47,6 +47,14 @@ def _assert_equal(label: str, left: object, right: object) -> None:
         raise AssertionError(f"{label} mismatch:\nleft={left!r}\nright={right!r}")
 
 
+def _assert_subset(label: str, required: set[str], lockfile: set[str]) -> None:
+    missing = required - lockfile
+    if missing:
+        raise AssertionError(
+            f"{label}: direct deps missing from lockfile: {sorted(missing)}"
+        )
+
+
 def main() -> int:
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
     project = pyproject["project"]
@@ -65,15 +73,18 @@ def main() -> int:
 
     runtime_names = {_normalise_name(dep) for dep in runtime_intent}
     dev_names = {_normalise_name(dep) for dep in dev_intent}
-    _assert_equal(
-        "requirements.txt pinned package names",
-        _read_pinned_names(ROOT / "requirements.txt"),
+    # pip-compile --generate-hashes produces a full transitive-closure lockfile,
+    # so the lockfile will always contain more packages than the direct-dep intent.
+    # The invariant is that every direct dep appears in the lockfile, not equality.
+    _assert_subset(
+        "requirements.txt",
         runtime_names,
+        _read_pinned_names(ROOT / "requirements.txt"),
     )
-    _assert_equal(
-        "requirements-dev.txt pinned package names",
+    _assert_subset(
+        "requirements-dev.txt",
+        runtime_names | dev_names,
         _read_pinned_names(ROOT / "requirements-dev.txt"),
-        dev_names,
     )
 
     return 0
