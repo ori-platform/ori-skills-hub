@@ -1,6 +1,6 @@
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.2
+    rev: c60c980e561ed3e73101667fe8365c609d19a438  # v0.15.9
     hooks:
       - id: ruff
         args: [--fix]
@@ -22,7 +22,7 @@ repos:
         files: ^(pyproject\.toml|requirements.*\.(in|txt))$
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: cef0300fd0fc4d2a87a85fa2093c6b283ea36f4b  # v5.0.0
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
