@@ -1,6 +1,6 @@
 name: "Implementation Issue"
-description: "Implementation task from the Ori Platform Bootstrap or Implementation Reference"
-title: "[REPLACE-PREFIX-NNN] "
+description: "Implementation task from the Ori Skills Hub Implementation Reference"
+title: "[HUB-NNN] "
 labels: []
 body:
   - type: markdown
@@ -8,6 +8,8 @@ body:
       value: |
         > Every issue must have clear acceptance criteria, explicit dependencies, and enough context
         > that a contributor who has never seen the codebase can deliver against it.
+        > Keep this issue scoped to the repository contract below.
+
 
   - type: textarea
     id: context
@@ -25,9 +27,10 @@ body:
       label: Scope
       description: "What this issue delivers. Be specific about files, packages, and interfaces."
       placeholder: |
-        - [ ] File/package to create or modify
-        - [ ] Interface or struct to implement
-        - [ ] Config or contract changes
+        - [ ] Python module under `hub/` to create or modify
+        - [ ] FastAPI route, storage adapter, signing helper, or validation rule
+        - [ ] Database model/migration if persistence-facing
+        - [ ] Tests under `tests/`
     validations:
       required: true
 
@@ -37,8 +40,8 @@ body:
       label: Non-Goals
       description: "What this issue explicitly does NOT do. Prevents scope creep."
       placeholder: |
-        - This issue does not implement X.
-        - This issue does not modify Y.
+        - This issue does not implement unrelated repo work.
+        - This issue does not change cross-repo contracts unless explicitly labelled contract-change.
     validations:
       required: true
 
@@ -48,8 +51,14 @@ body:
       label: Technical Specification
       description: "Code signatures, data types, algorithms, error handling. Enough detail to implement without guessing."
       placeholder: |
-        ```go
-        func NewFromConfig(cfg ProviderConfig) (Provider, error)
+        ```python
+        from fastapi import APIRouter
+
+        router = APIRouter()
+
+        @router.post("/api/skills/publish")
+        async def publish_skill() -> dict[str, object]:
+            ...
         ```
     validations:
       required: true
@@ -60,10 +69,12 @@ body:
       label: Acceptance Criteria
       description: "Checkboxes. Every one must be checked before the PR is merged."
       placeholder: |
-        - [ ] Criterion 1
-        - [ ] Criterion 2
-        - [ ] All existing tests pass
-        - [ ] New tests cover happy path and at least one failure path
+        - [ ] Security-sensitive paths fail closed
+        - [ ] Hub never executes skill hook code
+        - [ ] `pytest` passes
+        - [ ] `mypy` strict passes
+        - [ ] `ruff check` and `ruff format --check` pass
+        - [ ] Tests cover accepted and rejected paths
     validations:
       required: true
 
@@ -75,8 +86,9 @@ body:
       placeholder: |
         | Test | Verifies |
         |------|----------|
-        | `TestX` | Happy path |
-        | `TestY` | Error path |
+        | `test_<feature>_happy_path` | Expected API/storage/signing behavior |
+        | `test_<feature>_rejects_invalid_input` | Fail-closed behavior |
+        | `test_<feature>_does_not_execute_hooks` | Hub safety boundary, when relevant |
     validations:
       required: true
 
@@ -86,7 +98,10 @@ body:
       label: "Invariants — Do Not Violate"
       description: "Copy the specific AGENTS.md invariants that apply to this issue."
       placeholder: |
-        - **GW-2**: Every response must echo `request_id`.
+        - **HUB-1**: Verify before storage.
+        - **HUB-3**: Tier C/D skills require review.
+        - **HUB-8**: The Hub must never execute skill hooks.
+        - Hub root Ed25519 signing uses `cryptography` for runtime interoperability.
     validations:
       required: true
 
@@ -108,10 +123,12 @@ body:
     id: references
     attributes:
       label: Contract References
-      description: "Links to specs, implementation references, or runtime code."
+      description: "Links to specs, implementation references, runtime code, or SDK contract files relevant to this repo."
       placeholder: |
-        - `ori-specs/gateway-api/v1.md`
-        - Implementation Reference §4.4
+        - `ori-specs/skill-package/v1.md` — skill package schema
+        - `ori-specs/signing/v1.md` — Ed25519 signing contract
+        - Skills Hub Implementation Reference section for this issue
+        - Runtime `ori/skills/loader.py` and `ori/skills/signing.py` when mirroring validation/signing
     validations:
       required: false
 
@@ -132,4 +149,4 @@ body:
       options:
         - label: "contract-change — modifies cross-repo contract"
         - label: "runtime-impact — requires follow-up PR in ori-runtime"
-        - label: "security-sensitive — touches signing, tokens, keypairs, or Tier D"
+        - label: "security-sensitive — touches signing, tokens, keypairs, Tier C/D, or device credentials"
