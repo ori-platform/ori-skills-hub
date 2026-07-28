@@ -8,9 +8,19 @@ from __future__ import annotations
 from typing import Any
 
 from hub import __version__
+from hub.security.hub_keys import HubPublicTrustAnchors
 
 
-def create_app() -> Any:
+def health_payload(
+    *, trust_anchors: HubPublicTrustAnchors | None = None
+) -> dict[str, object]:
+    payload: dict[str, object] = {"status": "ok", "version": __version__}
+    if trust_anchors is not None:
+        payload["signing_trust_anchors"] = trust_anchors.as_dict()
+    return payload
+
+
+def create_app(*, trust_anchors: HubPublicTrustAnchors | None = None) -> Any:
     try:
         from fastapi import FastAPI
     except ImportError as exc:  # pragma: no cover - dependency installed in service env
@@ -19,8 +29,8 @@ def create_app() -> Any:
     app = FastAPI(title="Ori Skills Hub", version=__version__)
 
     @app.get("/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok", "version": __version__}
+    async def health() -> dict[str, object]:
+        return health_payload(trust_anchors=trust_anchors)
 
     return app
 

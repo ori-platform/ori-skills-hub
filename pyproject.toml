@@ -23,6 +23,9 @@ dependencies = [
   "uvicorn>=0.27",
 ]
 
+[project.scripts]
+ori-hub-keys = "hub.security.hub_keys:main"
+
 [project.optional-dependencies]
 dev = [
   "pytest>=8",
