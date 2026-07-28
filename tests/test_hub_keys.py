@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import stat
 from pathlib import Path
 
 import pytest
+from httpx import ASGITransport, AsyncClient, Response
 
 from hub.core.errors import ConfigError, SignatureVerificationError
 from hub.security import hub_keys
@@ -28,6 +30,7 @@ from hub.security.signing import (
     verify_artifact_signature,
     verify_manifest_signature,
 )
+from hub.web.main import create_app, health_payload
 
 _SEED_ONE = base64.b64encode(bytes(range(32))).decode("ascii")
 _SEED_TWO = base64.b64encode(bytes(reversed(range(32)))).decode("ascii")
@@ -421,3 +424,43 @@ def test_key_generation_command_never_prints_private_material(
     assert artifact_private not in captured.out
     assert captured.err == ""
 
+
+def test_health_exposes_only_profile_public_anchors() -> None:
+    keys = HubSigningKeys.from_base64_seeds(
+        manifest_seed_b64=_SEED_ONE,
+        artifact_seed_b64=_SEED_TWO,
+    )
+
+    payload = health_payload(trust_anchors=keys.public_trust_anchors)
+    rendered = repr(payload)
+
+    assert payload["signing_trust_anchors"] == keys.public_trust_anchors.as_dict()
+    assert _SEED_ONE not in rendered
+    assert _SEED_TWO not in rendered
+
+
+def test_health_route_exposes_only_profile_public_anchors() -> None:
+    keys = HubSigningKeys.from_base64_seeds(
+        manifest_seed_b64=_SEED_ONE,
+        artifact_seed_b64=_SEED_TWO,
+    )
+
+    async def request_health() -> Response:
+        transport = ASGITransport(
+            app=create_app(trust_anchors=keys.public_trust_anchors)
+        )
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            return await client.get("/health")
+
+    response = asyncio.run(request_health())
+
+    assert response.status_code == 200
+    assert response.json()["signing_trust_anchors"] == {
+        "manifest_public_key_b64": (keys.public_trust_anchors.manifest_public_key_b64),
+        "artifact_public_key_b64": (keys.public_trust_anchors.artifact_public_key_b64),
+    }
+    assert _SEED_ONE not in response.text
+    assert _SEED_TWO not in response.text
