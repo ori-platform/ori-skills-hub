@@ -124,6 +124,22 @@ safe trust-anchor and health surfaces. The shared signing vector corpus is
 pinned at SHA-256
 `13832babac98468ddd368aafd04c5140bba771f568500c50d4bac60c8588fddc`.
 
+## Skill Archive Safety
+
+Skill package inspection and rebuild use `hub.storage.tarball` and never extract
+untrusted members onto the Hub filesystem. Accepted packages are gzip-compressed
+tar archives containing exactly one `skill.yaml` at archive root or one
+directory deep. Wrapped packages must keep every member under that one package
+directory. Only canonical, portable regular-file and directory paths are
+accepted; links, sparse files, devices, traversal, duplicate paths, ambiguous
+manifests, YAML aliases, and non-JSON manifest values fail closed.
+
+Default limits are 10 MiB compressed, 64 MiB expanded tar data, 512 members,
+16 MiB per file, 48 MiB total file payload, and 512 KiB for `skill.yaml`.
+Rebuilds preserve safe member paths and non-manifest payloads, normalize
+untrusted archive metadata, and require every manifest field except the
+top-level `signature` to remain semantically unchanged.
+
 ## Security Gate
 
 Any skill declaring Tier C or Tier D action authority must enter
