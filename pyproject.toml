@@ -56,3 +56,7 @@ indent-style = "space"
 python_version = "3.11"
 strict = true
 packages = ["hub"]
+
+[[tool.mypy.overrides]]
+module = ["yaml", "yaml.*"]
+ignore_missing_imports = true
