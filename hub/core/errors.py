@@ -14,6 +14,10 @@ class SignatureVerificationError(HubError):
     """Raised when a skill signature is missing, malformed, or invalid."""
 
 
+class SkillValidationError(HubError):
+    """Raised when decoded skill metadata violates the package v1 contract."""
+
+
 class StorageSafetyError(HubError):
     """Raised when storage paths would escape the configured root."""
 

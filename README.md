@@ -140,6 +140,22 @@ Rebuilds preserve safe member paths and non-manifest payloads, normalize
 untrusted archive metadata, and require every manifest field except the
 top-level `signature` to remain semantically unchanged.
 
+## Skill Contract Validation
+
+Decoded manifests are validated by `hub.core.validation` without importing
+runtime or SDK internals. The validator enforces the current skill-package v1
+field shapes, trigger and action tiers, names, references, duplicate defenses,
+history-placeholder limit, and Tier B/C/D execution invariants. Tier D is
+rule-only even across action capability references, physical Tier B actions
+require approval or post-action policy, and Tier C safe defaults must use the
+built-in dashboard log or resolve to declared Tier A actions.
+
+Review classification consumes the same validated result. Malformed metadata is
+rejected instead of being classified for automatic listing, and any valid
+trigger or declared action carrying Tier C/D authority requires manual review.
+Descriptive top-level extensions remain intact and validation never opens or
+executes package hook code.
+
 ## Security Gate
 
 Any skill declaring Tier C or Tier D action authority must enter
