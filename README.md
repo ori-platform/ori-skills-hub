@@ -100,6 +100,46 @@ atomic database update for download counts. SQLite triggers also reject
 physical mutation of artifacts or transition audit rows, forged audit
 timestamps, illegal initial states, and illegal status transitions.
 
+## Author Identity Bootstrap
+
+Author registration is disabled by default. A deployment must opt in and
+provide an explicit bootstrap authority:
+
+```bash
+HUB_ADMIN_API_KEY=<at-least-32-random-characters>
+HUB_ADMIN_ACTOR_ID=bootstrap-admin
+HUB_AUTHOR_REGISTRATION_ENABLED=true
+HUB_AUTHOR_TOKEN_TTL_SECONDS=2592000
+```
+
+The registration, key-rotation, credential-rotation, and revocation endpoints
+require the admin bearer credential plus `Idempotency-Key` and
+`X-Correlation-ID` headers. Author bearer credentials cannot call these admin
+endpoints. They identify a stable author actor for the publication API.
+
+Author bearer credentials are generated from the operating system CSPRNG, not
+derived from the admin key or another predictable value. The raw credential is
+returned only during registration or credential rotation, with responses
+marked `no-store`; the database retains only an opaque lookup value and a
+SHA-256 digest. Key rotation, credential rotation, and revocation preserve
+append-only identity history and invalidate superseded credentials
+immediately.
+
+An author bearer credential is reusable until it expires or is revoked. It is
+not a per-request nonce, so deployments must expose these endpoints over HTTPS.
+Identity mutation idempotency keys are single-use per authenticated admin
+actor. Replaying one returns a conflict and never re-discloses a raw
+credential.
+Publication request idempotency and upload replay protection belong to the
+publication pipeline rather than the identity bootstrap API.
+
+The HUB-006 migration fails closed if it finds authors created through the
+earlier unauthenticated database bootstrap. Those records cannot be promoted
+into authenticated identities without inventing credential and audit history.
+An operator must migrate or remove them explicitly before retrying the schema
+upgrade. Downgrade also fails closed after an authenticated identity has been
+registered, preventing silent deletion of key and audit history.
+
 ## Hub Signing Keys
 
 The Hub uses distinct APIs for the two signing profiles in
