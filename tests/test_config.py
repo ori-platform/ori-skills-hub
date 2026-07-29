@@ -14,7 +14,92 @@ def test_load_from_env_requires_admin_key(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_load_from_env_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HUB_ADMIN_API_KEY", "secret")
+    monkeypatch.setenv("HUB_ADMIN_API_KEY", "a" * 32)
+    monkeypatch.delenv("HUB_ADMIN_ACTOR_ID", raising=False)
+    monkeypatch.delenv("HUB_AUTHOR_REGISTRATION_ENABLED", raising=False)
+    monkeypatch.delenv("HUB_AUTHOR_TOKEN_TTL_SECONDS", raising=False)
+
     cfg = load_from_env()
+
     assert cfg.storage_backend == "local"
     assert cfg.runtime_baseline == "v0.9.0-beta.2"
+    assert cfg.admin_actor_id == "bootstrap-admin"
+    assert cfg.author_registration_enabled is False
+    assert cfg.author_token_ttl_seconds == 2_592_000
+    assert cfg.admin_api_key not in repr(cfg)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("HUB_AUTHOR_REGISTRATION_ENABLED", "sometimes"),
+        ("HUB_AUTHOR_TOKEN_TTL_SECONDS", "not-an-integer"),
+        ("HUB_AUTHOR_TOKEN_TTL_SECONDS", "299"),
+        ("HUB_AUTHOR_TOKEN_TTL_SECONDS", "7776001"),
+    ],
+)
+def test_load_from_env_rejects_invalid_author_identity_config(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv("HUB_ADMIN_API_KEY", "a" * 32)
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ConfigError):
+        load_from_env()
+
+
+def test_load_from_env_rejects_weak_admin_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HUB_ADMIN_API_KEY", "secret")
+
+    with pytest.raises(ConfigError):
+        load_from_env()
+
+
+@pytest.mark.parametrize(
+    "admin_key",
+    [
+        f"{'a' * 16} {'a' * 16}",
+        f"{'a' * 16}\n{'a' * 16}",
+        "\u00e9" * 32,
+        "a" * 4097,
+    ],
+)
+def test_load_from_env_rejects_unusable_admin_key(
+    monkeypatch: pytest.MonkeyPatch,
+    admin_key: str,
+) -> None:
+    monkeypatch.setenv("HUB_ADMIN_API_KEY", admin_key)
+
+    with pytest.raises(ConfigError):
+        load_from_env()
+
+
+@pytest.mark.parametrize("actor_id", [f"{'a' * 128}\n{'a' * 128}", "a" * 256])
+def test_load_from_env_rejects_invalid_admin_actor_id(
+    monkeypatch: pytest.MonkeyPatch,
+    actor_id: str,
+) -> None:
+    monkeypatch.setenv("HUB_ADMIN_API_KEY", "a" * 32)
+    monkeypatch.setenv("HUB_ADMIN_ACTOR_ID", actor_id)
+
+    with pytest.raises(ConfigError):
+        load_from_env()
+
+
+def test_load_from_env_enables_author_registration_explicitly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HUB_ADMIN_API_KEY", "a" * 32)
+    monkeypatch.setenv("HUB_ADMIN_ACTOR_ID", "security-operator")
+    monkeypatch.setenv("HUB_AUTHOR_REGISTRATION_ENABLED", "true")
+    monkeypatch.setenv("HUB_AUTHOR_TOKEN_TTL_SECONDS", "3600")
+
+    cfg = load_from_env()
+
+    assert cfg.admin_actor_id == "security-operator"
+    assert cfg.author_registration_enabled is True
+    assert cfg.author_token_ttl_seconds == 3600
