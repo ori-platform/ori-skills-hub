@@ -15,6 +15,7 @@ Bootstrap scope:
 - Skill metadata and review status models.
 - Profile-separated Ed25519 signing, verification, and Hub key management.
 - Tier C/D review gate helpers.
+- Async SQLAlchemy persistence with append-only transition audit.
 - Local filesystem storage backend for signed tarballs.
 - Optional VirusTotal scan wrapper with safe disabled behavior.
 - CI, pre-commit, license headers, and contribution guardrails.
@@ -45,6 +46,7 @@ Relevant contracts:
 ```text
 hub/
   core/          config, models, review gate, validation contracts
+  db/            async lifecycle, internal mappings, transactional repository
   security/      profile-separated Ed25519 signing and key management
   storage/       local storage backend now; S3 later
   integrations/  optional external scanners/services
@@ -76,6 +78,27 @@ pre-commit install
 pre-commit run --all-files
 pytest -q
 ```
+
+## Database
+
+The current bootstrap uses SQLite through SQLAlchemy's async `aiosqlite` driver.
+The existing `sqlite:///...` `HUB_DATABASE_URL` shorthand is normalized
+internally. Other backends fail configuration explicitly until the deferred
+PostgreSQL posture, driver, and equivalent database-level guards are delivered.
+
+Apply schema changes with Alembic:
+
+```bash
+alembic upgrade head
+```
+
+`Database.bootstrap_schema()` exists for local and isolated test bootstrap and
+is safe to call repeatedly. Deployed environments should use Alembic instead.
+Writes go through `HubRepository`, which commits publication records and their
+audit events atomically, performs conditional review transitions, and uses an
+atomic database update for download counts. SQLite triggers also reject
+physical mutation of artifacts or transition audit rows, forged audit
+timestamps, illegal initial states, and illegal status transitions.
 
 ## Hub Signing Keys
 
