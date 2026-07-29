@@ -21,6 +21,7 @@ from sqlalchemy import (
     UniqueConstraint,
     event,
     func,
+    text,
 )
 from sqlalchemy.engine import Connection
 from sqlalchemy.orm import DeclarativeBase, Mapped, Mapper, mapped_column
@@ -228,6 +229,212 @@ _SQLITE_SCHEMA_GUARDS = (
         SELECT RAISE(ABORT, 'skill status transition requires matching audit');
     END
     """,
+    """
+    CREATE TRIGGER IF NOT EXISTS authors_validate_status_transition
+    BEFORE UPDATE OF status ON authors
+    WHEN NEW.status <> OLD.status
+         AND NOT (OLD.status = 'active' AND NEW.status = 'revoked')
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid author status transition');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS authors_validate_identity_revision
+    BEFORE UPDATE OF identity_revision ON authors
+    WHEN NEW.identity_revision <> OLD.identity_revision + 1
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid author identity revision');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS authors_require_identity_revision
+    BEFORE UPDATE OF status, public_key_b64 ON authors
+    WHEN NEW.identity_revision <> OLD.identity_revision + 1
+    BEGIN
+        SELECT RAISE(ABORT, 'author identity revision was not advanced');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS authors_validate_key_rotation
+    BEFORE UPDATE OF public_key_b64 ON authors
+    WHEN NOT EXISTS (
+             SELECT 1
+             FROM author_keys
+             WHERE author_id = OLD.id
+               AND public_key_b64 = NEW.public_key_b64
+               AND status = 'active'
+         )
+         OR NOT EXISTS (
+             SELECT 1
+             FROM author_keys
+             WHERE author_id = OLD.id
+               AND public_key_b64 = OLD.public_key_b64
+               AND status = 'revoked'
+         )
+    BEGIN
+        SELECT RAISE(ABORT, 'author key rotation history is incomplete');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS authors_reject_identity_metadata_update
+    BEFORE UPDATE OF external_subject, display_handle ON authors
+    BEGIN
+        SELECT RAISE(ABORT, 'author identity metadata is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS author_keys_reject_identity_update
+    BEFORE UPDATE OF author_id, public_key_b64, fingerprint ON author_keys
+    BEGIN
+        SELECT RAISE(ABORT, 'author key identity is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS author_keys_reject_revoked_at_rewrite
+    BEFORE UPDATE OF revoked_at ON author_keys
+    WHEN NOT (
+        OLD.status = 'active'
+        AND NEW.status = 'revoked'
+        AND OLD.revoked_at IS NULL
+        AND NEW.revoked_at IS NOT NULL
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'author key revocation timestamp is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS author_keys_validate_status_transition
+    BEFORE UPDATE OF status ON author_keys
+    WHEN NEW.status <> OLD.status
+         AND NOT (
+             OLD.status = 'active'
+             AND NEW.status = 'revoked'
+             AND NEW.revoked_at IS NOT NULL
+         )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid author key status transition');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS author_keys_reject_delete
+    BEFORE DELETE ON author_keys
+    BEGIN
+        SELECT RAISE(ABORT, 'author key history is append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS author_credentials_validate_status_transition
+    BEFORE UPDATE OF status ON author_credentials
+    WHEN NEW.status <> OLD.status
+         AND NOT (
+             OLD.status = 'active'
+             AND (
+                 (NEW.status = 'revoked' AND NEW.revoked_at IS NOT NULL)
+                 OR NEW.status = 'expired'
+             )
+         )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid author credential status transition');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS author_credentials_reject_identity_update
+    BEFORE UPDATE OF author_id, kind, lookup_id, credential_hash, expires_at
+    ON author_credentials
+    BEGIN
+        SELECT RAISE(ABORT, 'author credential identity is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS author_credentials_reject_revoked_at_rewrite
+    BEFORE UPDATE OF revoked_at ON author_credentials
+    WHEN NOT (
+        OLD.status = 'active'
+        AND NEW.status = 'revoked'
+        AND OLD.revoked_at IS NULL
+        AND NEW.revoked_at IS NOT NULL
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'author credential revocation timestamp is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS author_credentials_reject_delete
+    BEFORE DELETE ON author_credentials
+    BEGIN
+        SELECT RAISE(ABORT, 'author credential history is append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS author_identity_audit_reject_update
+    BEFORE UPDATE ON author_identity_audit
+    BEGIN
+        SELECT RAISE(ABORT, 'author identity audit is append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS author_identity_audit_reject_delete
+    BEFORE DELETE ON author_identity_audit
+    BEGIN
+        SELECT RAISE(ABORT, 'author identity audit is append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS author_identity_audit_validate_timestamp
+    BEFORE INSERT ON author_identity_audit
+    WHEN NEW.occurred_at <> CURRENT_TIMESTAMP
+    BEGIN
+        SELECT RAISE(ABORT, 'identity audit timestamps are database-generated');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS author_identity_audit_validate_ownership
+    BEFORE INSERT ON author_identity_audit
+    WHEN NEW.transition_number <> (
+             SELECT identity_revision
+             FROM authors
+             WHERE id = NEW.author_id
+         )
+         OR (
+             NEW.prior_key_fingerprint IS NOT NULL
+             AND NOT EXISTS (
+                 SELECT 1
+                 FROM author_keys
+                 WHERE author_id = NEW.author_id
+                   AND fingerprint = NEW.prior_key_fingerprint
+             )
+         )
+         OR (
+             NEW.new_key_fingerprint IS NOT NULL
+             AND NOT EXISTS (
+                 SELECT 1
+                 FROM author_keys
+                 WHERE author_id = NEW.author_id
+                   AND fingerprint = NEW.new_key_fingerprint
+             )
+         )
+         OR (
+             NEW.prior_credential_id IS NOT NULL
+             AND NOT EXISTS (
+                 SELECT 1
+                 FROM author_credentials
+                 WHERE author_id = NEW.author_id
+                   AND id = NEW.prior_credential_id
+             )
+         )
+         OR (
+             NEW.new_credential_id IS NOT NULL
+             AND NOT EXISTS (
+                 SELECT 1
+                 FROM author_credentials
+                 WHERE author_id = NEW.author_id
+                   AND id = NEW.new_credential_id
+             )
+         )
+    BEGIN
+        SELECT RAISE(ABORT, 'identity audit references invalid author state');
+    END
+    """,
 )
 
 NAMING_CONVENTION = {
@@ -269,6 +476,7 @@ class AuthorModel(Base):
         CheckConstraint("length(display_handle) > 0", name="display_handle_set"),
         CheckConstraint("length(public_key_b64) > 0", name="public_key_set"),
         CheckConstraint("status IN ('active', 'revoked')", name="status_valid"),
+        CheckConstraint("identity_revision >= 1", name="identity_revision_positive"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_record_id)
@@ -277,6 +485,9 @@ class AuthorModel(Base):
     public_key_b64: Mapped[str] = mapped_column(String(255), unique=True)
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="active", server_default="active"
+    )
+    identity_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
@@ -303,7 +514,20 @@ class AuthorCredentialModel(Base):
         CheckConstraint(
             "status IN ('active', 'revoked', 'expired')", name="status_valid"
         ),
+        CheckConstraint(
+            "(status = 'active' AND revoked_at IS NULL) "
+            "OR (status = 'revoked' AND revoked_at IS NOT NULL) "
+            "OR (status = 'expired' AND revoked_at IS NULL)",
+            name="revocation_state_valid",
+        ),
         Index("ix_author_credentials_author_id", "author_id"),
+        Index(
+            "uq_author_credentials_one_active_kind",
+            "author_id",
+            "kind",
+            unique=True,
+            sqlite_where=text("status = 'active'"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_record_id)
@@ -322,6 +546,135 @@ class AuthorCredentialModel(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+
+
+class AuthorKeyModel(Base):
+    """Immutable Ed25519 author-key identity with revocation history."""
+
+    __tablename__ = "author_keys"
+    __table_args__ = (
+        CheckConstraint("length(public_key_b64) > 0", name="public_key_set"),
+        CheckConstraint(
+            "fingerprint LIKE 'sha256:%' AND length(fingerprint) = 71",
+            name="fingerprint_valid",
+        ),
+        CheckConstraint("status IN ('active', 'revoked')", name="status_valid"),
+        CheckConstraint(
+            "(status = 'active' AND revoked_at IS NULL) "
+            "OR (status = 'revoked' AND revoked_at IS NOT NULL)",
+            name="revocation_state_valid",
+        ),
+        Index("ix_author_keys_author_id", "author_id"),
+        Index(
+            "uq_author_keys_one_active_per_author",
+            "author_id",
+            unique=True,
+            sqlite_where=text("status = 'active'"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_record_id)
+    author_id: Mapped[str] = mapped_column(
+        ForeignKey("authors.id", ondelete="RESTRICT"), nullable=False
+    )
+    public_key_b64: Mapped[str] = mapped_column(
+        String(255), nullable=False, unique=True
+    )
+    fingerprint: Mapped[str] = mapped_column(String(71), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="active", server_default="active"
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+
+
+class AuthorIdentityAuditModel(Base):
+    """Append-only author registration, rotation, and revocation history."""
+
+    __tablename__ = "author_identity_audit"
+    __table_args__ = (
+        UniqueConstraint("actor_id", "idempotency_key", name="actor_idempotency"),
+        UniqueConstraint(
+            "author_id",
+            "transition_number",
+            name="author_transition_number",
+        ),
+        CheckConstraint(
+            "event_type IN "
+            "('registered', 'key_rotated', 'credential_rotated', 'author_revoked')",
+            name="event_type_valid",
+        ),
+        CheckConstraint("transition_number >= 1", name="transition_number_positive"),
+        CheckConstraint("length(actor_id) > 0", name="actor_set"),
+        CheckConstraint("length(reason) > 0", name="reason_set"),
+        CheckConstraint("length(correlation_id) > 0", name="correlation_id_set"),
+        CheckConstraint("length(idempotency_key) > 0", name="idempotency_key_set"),
+        CheckConstraint(
+            "prior_key_fingerprint IS NULL "
+            "OR (prior_key_fingerprint LIKE 'sha256:%' "
+            "AND length(prior_key_fingerprint) = 71)",
+            name="prior_key_fingerprint_valid",
+        ),
+        CheckConstraint(
+            "new_key_fingerprint IS NULL "
+            "OR (new_key_fingerprint LIKE 'sha256:%' "
+            "AND length(new_key_fingerprint) = 71)",
+            name="new_key_fingerprint_valid",
+        ),
+        CheckConstraint(
+            "(event_type = 'registered' "
+            "AND prior_key_fingerprint IS NULL "
+            "AND new_key_fingerprint IS NOT NULL "
+            "AND prior_credential_id IS NULL "
+            "AND new_credential_id IS NOT NULL) "
+            "OR (event_type = 'key_rotated' "
+            "AND prior_key_fingerprint IS NOT NULL "
+            "AND new_key_fingerprint IS NOT NULL "
+            "AND prior_key_fingerprint <> new_key_fingerprint "
+            "AND prior_credential_id IS NULL "
+            "AND new_credential_id IS NULL) "
+            "OR (event_type = 'credential_rotated' "
+            "AND prior_key_fingerprint IS NULL "
+            "AND new_key_fingerprint IS NULL "
+            "AND prior_credential_id IS NOT NULL "
+            "AND new_credential_id IS NOT NULL "
+            "AND prior_credential_id <> new_credential_id) "
+            "OR (event_type = 'author_revoked' "
+            "AND prior_key_fingerprint IS NOT NULL "
+            "AND new_key_fingerprint IS NULL "
+            "AND new_credential_id IS NULL)",
+            name="event_metadata_valid",
+        ),
+        Index(
+            "ix_author_identity_audit_author_time",
+            "author_id",
+            "occurred_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_record_id)
+    author_id: Mapped[str] = mapped_column(
+        ForeignKey("authors.id", ondelete="RESTRICT"), nullable=False
+    )
+    transition_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[str] = mapped_column(String(1024), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+    correlation_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    prior_key_fingerprint: Mapped[str | None] = mapped_column(String(71))
+    new_key_fingerprint: Mapped[str | None] = mapped_column(String(71))
+    prior_credential_id: Mapped[str | None] = mapped_column(
+        ForeignKey("author_credentials.id", ondelete="RESTRICT")
+    )
+    new_credential_id: Mapped[str | None] = mapped_column(
+        ForeignKey("author_credentials.id", ondelete="RESTRICT")
     )
 
 
@@ -533,8 +886,43 @@ def _reject_client_audit_timestamp(
         raise ImmutableRecordError("audit timestamps are database-generated")
 
 
+def _reject_author_update(
+    _mapper: Mapper[Any], _connection: Connection, _target: AuthorModel
+) -> None:
+    raise InvalidStateTransitionError(
+        "author identity transitions must use AuthorIdentityRepository"
+    )
+
+
+def _validate_identity_record_update(
+    _mapper: Mapper[Any], _connection: Connection, _target: object
+) -> None:
+    raise InvalidStateTransitionError(
+        "author key and credential transitions must use AuthorIdentityRepository"
+    )
+
+
+def _reject_client_identity_audit_timestamp(
+    _mapper: Mapper[Any],
+    _connection: Connection,
+    target: AuthorIdentityAuditModel,
+) -> None:
+    if target.occurred_at is not None:
+        raise ImmutableRecordError("identity audit timestamps are database-generated")
+
+
 event.listen(ArtifactModel, "before_update", _reject_immutable_change)
 event.listen(ArtifactModel, "before_delete", _reject_immutable_change)
+event.listen(AuthorIdentityAuditModel, "before_update", _reject_immutable_change)
+event.listen(AuthorIdentityAuditModel, "before_delete", _reject_immutable_change)
+event.listen(
+    AuthorIdentityAuditModel,
+    "before_insert",
+    _reject_client_identity_audit_timestamp,
+)
+event.listen(AuthorModel, "before_update", _reject_author_update)
+event.listen(AuthorKeyModel, "before_update", _validate_identity_record_update)
+event.listen(AuthorCredentialModel, "before_update", _validate_identity_record_update)
 event.listen(SkillTransitionAuditModel, "before_update", _reject_immutable_change)
 event.listen(SkillTransitionAuditModel, "before_delete", _reject_immutable_change)
 event.listen(

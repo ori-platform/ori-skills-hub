@@ -17,13 +17,6 @@ class SkillStatus(StrEnum):
 
 
 @dataclass(frozen=True)
-class Author:
-    github: str
-    public_key_b64: str
-    verified: bool = False
-
-
-@dataclass(frozen=True)
 class SkillRecord:
     name: str
     version: str
