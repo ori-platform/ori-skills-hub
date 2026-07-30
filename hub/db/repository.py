@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import NoReturn
 
 from sqlalchemy import insert, literal, select, update
@@ -15,8 +14,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from hub.core.models import SkillStatus
 from hub.db._models import (
     ArtifactModel,
-    AuthorCredentialModel,
-    AuthorModel,
     SkillTransitionAuditModel,
     SkillVersionModel,
     new_record_id,
@@ -72,56 +69,11 @@ class HubRepository:
     def __init__(self, database: Database) -> None:
         self._database = database
 
-    async def create_author(
-        self,
-        *,
-        external_subject: str,
-        display_handle: str,
-        public_key_b64: str,
-    ) -> AuthorModel:
-        author = AuthorModel(
-            external_subject=_required(external_subject, "external_subject"),
-            display_handle=_required(display_handle, "display_handle"),
-            public_key_b64=_required(public_key_b64, "public_key_b64"),
-        )
-        try:
-            async with self._database.transaction() as session:
-                session.add(author)
-                await session.flush()
-        except IntegrityError as exc:
-            raise _conflict("author creation", exc) from exc
-        return author
-
-    async def add_credential(
-        self,
-        *,
-        author_id: str,
-        kind: str,
-        lookup_id: str,
-        credential_hash: str,
-        expires_at: datetime | None = None,
-    ) -> AuthorCredentialModel:
-        credential = AuthorCredentialModel(
-            author_id=_required(author_id, "author_id"),
-            kind=_required(kind, "kind"),
-            lookup_id=_required(lookup_id, "lookup_id"),
-            credential_hash=_digest(credential_hash, "credential_hash"),
-            expires_at=expires_at,
-        )
-        try:
-            async with self._database.transaction() as session:
-                session.add(credential)
-                await session.flush()
-        except IntegrityError as exc:
-            raise _conflict("credential creation", exc) from exc
-        return credential
-
     async def create_publication(
         self,
         *,
         name: str,
         version: str,
-        author_id: str,
         artifact_digest: str,
         manifest_digest: str,
         storage_key: str,
@@ -165,7 +117,7 @@ class HubRepository:
             id=new_record_id(),
             name=_required(name, "name"),
             version=_required(version, "version"),
-            author_id=_required(author_id, "author_id"),
+            author_id=actor_id,
             artifact_id=artifact.id,
             status=initial_status.value,
             declares_tier_cd=declares_tier_cd,

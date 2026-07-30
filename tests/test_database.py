@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import sqlite3
 from collections.abc import Coroutine
 from datetime import UTC, datetime
@@ -29,16 +30,17 @@ from hub.db import (
 )
 from hub.db._models import (
     ArtifactModel,
-    AuthorCredentialModel,
+    AuthorModel,
     SkillTransitionAuditModel,
     SkillVersionModel,
     new_record_id,
 )
+from hub.security.author_identity import AuthorIdentityService
 
 _T = TypeVar("_T")
 _ARTIFACT_DIGEST = f"sha256:{'a' * 64}"
 _MANIFEST_DIGEST = f"sha256:{'b' * 64}"
-_CREDENTIAL_HASH = f"sha256:{'c' * 64}"
+_AUTHOR_PUBLIC_KEY = base64.b64encode(bytes(range(32))).decode("ascii")
 
 
 def _run(awaitable: Coroutine[Any, Any, _T]) -> _T:
@@ -49,12 +51,19 @@ async def _setup_repository(tmp_path: Path) -> tuple[Database, HubRepository, st
     database = Database(f"sqlite:///{tmp_path / 'hub.db'}")
     await database.bootstrap_schema()
     repository = HubRepository(database)
-    author = await repository.create_author(
+    identity_service = AuthorIdentityService(
+        database,
+        token_ttl_seconds=300,
+    )
+    registration = await identity_service.register(
         external_subject="github:123",
         display_handle="ori-author",
-        public_key_b64="author-public-key",
+        public_key_b64=_AUTHOR_PUBLIC_KEY,
+        authenticated_actor_id="test-bootstrap",
+        correlation_id="test-bootstrap",
+        idempotency_key="test-bootstrap",
     )
-    return database, repository, author.id
+    return database, repository, registration.author.author_id
 
 
 async def _publish(
@@ -66,13 +75,11 @@ async def _publish(
     digest_character: str = "a",
     declares_tier_cd: bool = False,
     initial_status: SkillStatus = SkillStatus.LISTED,
-    actor_id: str = "author:123",
     idempotency_key: str = "publish-energy-1.0.0",
 ) -> SkillVersionModel:
     return await repository.create_publication(
         name=name,
         version=version,
-        author_id=author_id,
         artifact_digest=f"sha256:{digest_character * 64}",
         manifest_digest=_MANIFEST_DIGEST,
         storage_key=f"{name}/{version}/{digest_character}.tar.gz",
@@ -81,7 +88,7 @@ async def _publish(
         manifest_signature="manifest-signature",
         declares_tier_cd=declares_tier_cd,
         initial_status=initial_status,
-        authenticated_actor_id=actor_id,
+        authenticated_actor_id=author_id,
         reason="validated publication",
         correlation_id=f"publish:{name}:{version}",
         idempotency_key=idempotency_key,
@@ -118,6 +125,8 @@ def test_bootstrap_is_idempotent(tmp_path: Path) -> None:
     assert _run(scenario()) == {
         "artifacts",
         "author_credentials",
+        "author_identity_audit",
+        "author_keys",
         "authors",
         "skill_transition_audit",
         "skill_versions",
@@ -150,11 +159,39 @@ def test_alembic_upgrade_is_repeatable(
                 "SELECT name FROM sqlite_master WHERE type = 'trigger'"
             )
         }
-    assert revision == ("baa9ab020328",)
+    assert revision == ("1e9630e268d4",)
     assert "skill_transition_audit" in tables
     assert triggers == {
         "artifacts_reject_delete",
         "artifacts_reject_update",
+        "author_credentials_reject_delete",
+        "author_credentials_reject_identity_update",
+        "author_credentials_reject_revoked_at_rewrite",
+        "author_credentials_require_identity_audit",
+        "author_credentials_validate_initial_identity",
+        "author_credentials_validate_status_transition",
+        "author_identity_audit_reject_delete",
+        "author_identity_audit_reject_update",
+        "author_identity_audit_apply_credential_rotation",
+        "author_identity_audit_apply_key_rotation",
+        "author_identity_audit_apply_registration",
+        "author_identity_audit_apply_revocation",
+        "author_identity_audit_validate_ownership",
+        "author_identity_audit_validate_timestamp",
+        "author_keys_reject_delete",
+        "author_keys_reject_identity_update",
+        "author_keys_reject_revoked_at_rewrite",
+        "author_keys_require_identity_audit",
+        "author_keys_validate_initial_identity",
+        "author_keys_validate_status_transition",
+        "authors_reject_delete",
+        "authors_reject_identity_metadata_update",
+        "authors_require_identity_audit",
+        "authors_require_identity_revision",
+        "authors_validate_initial_identity",
+        "authors_validate_identity_revision",
+        "authors_validate_key_rotation",
+        "authors_validate_status_transition",
         "skill_transition_audit_reject_delete",
         "skill_transition_audit_reject_update",
         "skill_transition_audit_apply_listing",
@@ -170,55 +207,92 @@ def test_alembic_upgrade_is_repeatable(
     }
 
 
-def test_author_and_credential_constraints_do_not_store_raw_tokens(
+def test_identity_migration_rejects_unaudited_legacy_authors(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def scenario() -> None:
-        database, repository, author_id = await _setup_repository(tmp_path)
-        try:
-            credential = await repository.add_credential(
-                author_id=author_id,
-                kind="publish_token",
-                lookup_id="credential_01JABC",
-                credential_hash=_CREDENTIAL_HASH,
+    database_path = tmp_path / "legacy-author.db"
+    monkeypatch.setenv("HUB_DATABASE_URL", f"sqlite:///{database_path}")
+    config = Config(str(Path(__file__).parents[1] / "alembic.ini"))
+    command.upgrade(config, "baa9ab020328")
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO authors (
+                id,
+                external_subject,
+                display_handle,
+                public_key_b64
+            ) VALUES (?, ?, ?, ?)
+            """,
+            ("a" * 32, "legacy:123", "legacy-author", _AUTHOR_PUBLIC_KEY),
+        )
+
+    with pytest.raises(RuntimeError, match="cannot promote legacy authors"):
+        command.upgrade(config, "head")
+
+    with sqlite3.connect(database_path) as connection:
+        revision = connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone()
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
-            assert credential.credential_hash == _CREDENTIAL_HASH
-            assert "token" not in AuthorCredentialModel.__table__.columns
+        }
+        author_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(authors)")
+        }
 
-            with pytest.raises(ValueError, match="sha256"):
-                await repository.add_credential(
-                    author_id=author_id,
-                    kind="publish_token",
-                    lookup_id="credential_01JRAW",
-                    credential_hash="raw-bearer-token",
-                )
-            with pytest.raises(PersistenceConflictError):
-                await repository.add_credential(
-                    author_id=author_id,
-                    kind="publish_token",
-                    lookup_id="credential_01JABC",
-                    credential_hash=f"sha256:{'d' * 64}",
-                )
-        finally:
-            await database.dispose()
-
-    _run(scenario())
+    assert revision == ("baa9ab020328",)
+    assert "author_keys" not in tables
+    assert "identity_revision" not in author_columns
 
 
-def test_author_identity_is_unique(tmp_path: Path) -> None:
-    async def scenario() -> None:
-        database, repository, _author_id = await _setup_repository(tmp_path)
+def test_identity_migration_refuses_to_discard_identity_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "identity-downgrade.db"
+    monkeypatch.setenv("HUB_DATABASE_URL", f"sqlite:///{database_path}")
+    config = Config(str(Path(__file__).parents[1] / "alembic.ini"))
+    command.upgrade(config, "head")
+
+    async def register() -> None:
+        database = Database(f"sqlite:///{database_path}")
         try:
-            with pytest.raises(PersistenceConflictError):
-                await repository.create_author(
-                    external_subject="github:456",
-                    display_handle="ori-author",
-                    public_key_b64="different-public-key",
-                )
+            service = AuthorIdentityService(database, token_ttl_seconds=300)
+            await service.register(
+                external_subject="github:downgrade-test",
+                display_handle="downgrade-test",
+                public_key_b64=_AUTHOR_PUBLIC_KEY,
+                authenticated_actor_id="test-bootstrap",
+                correlation_id="test-downgrade",
+                idempotency_key="test-downgrade",
+            )
         finally:
             await database.dispose()
 
-    _run(scenario())
+    _run(register())
+
+    with pytest.raises(RuntimeError, match="cannot downgrade"):
+        command.downgrade(config, "baa9ab020328")
+
+    with sqlite3.connect(database_path) as connection:
+        revision = connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone()
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+
+    assert revision == ("1e9630e268d4",)
+    assert {"author_keys", "author_identity_audit"} <= tables
 
 
 def test_publication_writes_artifact_skill_and_initial_audit_atomically(
@@ -294,6 +368,67 @@ def test_failed_publication_rolls_back_its_artifact(tmp_path: Path) -> None:
                 artifact_count = await session.scalar(
                     select(func.count()).select_from(ArtifactModel)
                 )
+            assert artifact_count == 0
+        finally:
+            await database.dispose()
+
+    _run(scenario())
+
+
+def test_pending_and_revoked_authors_cannot_publish(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database, repository, active_author_id = await _setup_repository(tmp_path)
+        pending_author_id = new_record_id()
+        try:
+            async with database.transaction() as session:
+                await session.execute(
+                    insert(AuthorModel).values(
+                        id=pending_author_id,
+                        external_subject="github:pending",
+                        display_handle="pending-author",
+                        public_key_b64="pending-public-key",
+                        status="pending_registration",
+                        identity_revision=1,
+                    )
+                )
+
+            with pytest.raises(PersistenceConflictError):
+                await _publish(
+                    repository,
+                    author_id=pending_author_id,
+                    name="pending-author-skill",
+                    digest_character="d",
+                    idempotency_key="pending-author-publication",
+                )
+
+            identity_service = AuthorIdentityService(
+                database,
+                token_ttl_seconds=300,
+            )
+            await identity_service.revoke(
+                author_id=active_author_id,
+                authenticated_actor_id="test-bootstrap",
+                reason="test author revocation",
+                correlation_id="test-author-revocation",
+                idempotency_key="test-author-revocation",
+            )
+            with pytest.raises(PersistenceConflictError):
+                await _publish(
+                    repository,
+                    author_id=active_author_id,
+                    name="revoked-author-skill",
+                    digest_character="e",
+                    idempotency_key="revoked-author-publication",
+                )
+
+            async with database.transaction() as session:
+                skill_count = await session.scalar(
+                    select(func.count()).select_from(SkillVersionModel)
+                )
+                artifact_count = await session.scalar(
+                    select(func.count()).select_from(ArtifactModel)
+                )
+            assert skill_count == 0
             assert artifact_count == 0
         finally:
             await database.dispose()
@@ -529,18 +664,36 @@ def test_alembic_schema_blocks_direct_sql_review_gate_bypasses(
     async def scenario() -> None:
         database = Database(f"sqlite:///{database_path}")
         repository = HubRepository(database)
+        identity_service = AuthorIdentityService(
+            database,
+            token_ttl_seconds=300,
+        )
         try:
-            author = await repository.create_author(
+            registration = await identity_service.register(
                 external_subject="github:migrated",
                 display_handle="migrated-author",
-                public_key_b64="migrated-author-public-key",
+                public_key_b64=_AUTHOR_PUBLIC_KEY,
+                authenticated_actor_id="test-migrated-bootstrap",
+                correlation_id="test-migrated-bootstrap",
+                idempotency_key="test-migrated-bootstrap",
             )
             skill = await _publish(
                 repository,
-                author_id=author.id,
+                author_id=registration.author.author_id,
                 declares_tier_cd=True,
                 initial_status=SkillStatus.PENDING_REVIEW,
             )
+
+            with pytest.raises(IntegrityError, match="matching audit"):
+                async with database.transaction() as session:
+                    await session.execute(
+                        update(AuthorModel)
+                        .where(AuthorModel.id == registration.author.author_id)
+                        .values(
+                            status="revoked",
+                            identity_revision=2,
+                        )
+                    )
 
             with pytest.raises(IntegrityError, match="matching audit"):
                 async with database.transaction() as session:
@@ -619,7 +772,7 @@ def test_review_and_unlist_retain_complete_server_owned_history(
                 (entry.prior_status, entry.new_status, entry.actor_id)
                 for entry in history
             ] == [
-                (None, "pending_review", "author:123"),
+                (None, "pending_review", author_id),
                 ("pending_review", "listed", "reviewer:42"),
                 ("listed", "unlisted", "reviewer:84"),
             ]
