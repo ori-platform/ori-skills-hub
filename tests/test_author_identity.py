@@ -40,7 +40,7 @@ from hub.security.author_identity import (
     InvalidAuthorIdentityError,
 )
 from hub.web.authors import author_authentication_dependency
-from hub.web.main import create_app
+from hub.web.main import create_app, create_configured_app
 
 _T = TypeVar("_T")
 _KEY_ONE = base64.b64encode(bytes(range(32))).decode("ascii")
@@ -584,12 +584,15 @@ def test_database_guards_block_identity_and_history_bypasses(
             credentials = await repository.get_credentials(author_id=author_id)
             history = await repository.get_identity_history(author_id=author_id)
 
-            with pytest.raises(IntegrityError, match="revision was not advanced"):
+            with pytest.raises(IntegrityError, match="matching audit"):
                 async with database.transaction() as session:
                     await session.execute(
                         update(AuthorModel)
                         .where(AuthorModel.id == author_id)
-                        .values(status="revoked")
+                        .values(
+                            status="revoked",
+                            identity_revision=2,
+                        )
                     )
             with pytest.raises(IntegrityError, match="metadata is immutable"):
                 async with database.transaction() as session:
@@ -607,13 +610,16 @@ def test_database_guards_block_identity_and_history_bypasses(
                     )
             with pytest.raises(
                 IntegrityError,
-                match="revocation timestamp is immutable",
+                match="matching identity audit",
             ):
                 async with database.transaction() as session:
                     await session.execute(
                         update(AuthorKeyModel)
                         .where(AuthorKeyModel.id == keys[0].id)
-                        .values(revoked_at=datetime.now(UTC))
+                        .values(
+                            status="revoked",
+                            revoked_at=func.current_timestamp(),
+                        )
                     )
             with pytest.raises(IntegrityError, match="identity is immutable"):
                 async with database.transaction() as session:
@@ -624,13 +630,55 @@ def test_database_guards_block_identity_and_history_bypasses(
                     )
             with pytest.raises(
                 IntegrityError,
-                match="revocation timestamp is immutable",
+                match="matching identity audit",
             ):
                 async with database.transaction() as session:
                     await session.execute(
                         update(AuthorCredentialModel)
                         .where(AuthorCredentialModel.id == credentials[0].id)
-                        .values(revoked_at=datetime.now(UTC))
+                        .values(
+                            status="revoked",
+                            revoked_at=func.current_timestamp(),
+                        )
+                    )
+            with pytest.raises(IntegrityError, match="pending registration"):
+                async with database.transaction() as session:
+                    await session.execute(
+                        insert(AuthorModel).values(
+                            id="d" * 32,
+                            external_subject="github:direct-sql",
+                            display_handle="direct-sql",
+                            public_key_b64=_KEY_TWO,
+                            status="active",
+                            identity_revision=1,
+                        )
+                    )
+            with pytest.raises(IntegrityError, match="key must start pending"):
+                async with database.transaction() as session:
+                    await session.execute(
+                        insert(AuthorKeyModel).values(
+                            id="d" * 32,
+                            author_id=author_id,
+                            public_key_b64=_KEY_TWO,
+                            fingerprint=(
+                                "sha256:"
+                                f"{hashlib.sha256(base64.b64decode(_KEY_TWO)).hexdigest()}"
+                            ),
+                            status="active",
+                        )
+                    )
+            with pytest.raises(IntegrityError, match="credential must start pending"):
+                async with database.transaction() as session:
+                    await session.execute(
+                        insert(AuthorCredentialModel).values(
+                            id="d" * 32,
+                            author_id=author_id,
+                            kind="forged_bearer",
+                            lookup_id="forged-lookup",
+                            credential_hash=f"sha256:{'d' * 64}",
+                            status="active",
+                            expires_at=datetime.now(UTC) + timedelta(hours=1),
+                        )
                     )
             with pytest.raises(IntegrityError, match="append-only"):
                 async with database.transaction() as session:
@@ -645,20 +693,29 @@ def test_database_guards_block_identity_and_history_bypasses(
             ):
                 async with database.transaction() as session:
                     await session.execute(
+                        insert(AuthorKeyModel).values(
+                            id="f" * 32,
+                            author_id=author_id,
+                            public_key_b64=_KEY_TWO,
+                            fingerprint=f"sha256:{'f' * 64}",
+                            status="pending",
+                        )
+                    )
+                    await session.execute(
                         insert(AuthorIdentityAuditModel).values(
                             id="f" * 32,
                             author_id=author_id,
-                            transition_number=1,
+                            transition_number=2,
                             actor_id="forged-actor",
-                            event_type="registered",
+                            event_type="key_rotated",
                             reason="attempt forged audit timestamp",
                             occurred_at=datetime(2000, 1, 1, tzinfo=UTC),
                             correlation_id="forged-correlation",
                             idempotency_key="forged-idempotency",
-                            prior_key_fingerprint=None,
-                            new_key_fingerprint=keys[0].fingerprint,
+                            prior_key_fingerprint=keys[0].fingerprint,
+                            new_key_fingerprint=f"sha256:{'f' * 64}",
                             prior_credential_id=None,
-                            new_credential_id=credentials[0].id,
+                            new_credential_id=None,
                         )
                     )
             with pytest.raises(IntegrityError, match="invalid author state"):
@@ -683,6 +740,147 @@ def test_database_guards_block_identity_and_history_bypasses(
             await database.dispose()
 
     _run(scenario())
+
+
+def test_direct_orm_identity_changes_require_identity_repository(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        database, repository, service, _clock = await _setup(tmp_path)
+        try:
+            registration = await _register(service)
+            author_id = registration.author.author_id
+            keys = await repository.get_key_history(author_id=author_id)
+            credentials = await repository.get_credentials(author_id=author_id)
+
+            async with database.transaction() as session:
+                author = await session.get(AuthorModel, author_id)
+                assert author is not None
+                author.status = "revoked"
+                with pytest.raises(
+                    InvalidStateTransitionError,
+                    match="AuthorIdentityRepository",
+                ):
+                    await session.flush()
+
+            async with database.transaction() as session:
+                key = await session.get(AuthorKeyModel, keys[0].id)
+                assert key is not None
+                key.status = "revoked"
+                key.revoked_at = datetime.now(UTC)
+                with pytest.raises(
+                    InvalidStateTransitionError,
+                    match="AuthorIdentityRepository",
+                ):
+                    await session.flush()
+
+            async with database.transaction() as session:
+                credential = await session.get(
+                    AuthorCredentialModel,
+                    credentials[0].id,
+                )
+                assert credential is not None
+                credential.status = "revoked"
+                credential.revoked_at = datetime.now(UTC)
+                with pytest.raises(
+                    InvalidStateTransitionError,
+                    match="AuthorIdentityRepository",
+                ):
+                    await session.flush()
+
+            unchanged = await repository.get_author(author_id=author_id)
+            history = await repository.get_identity_history(author_id=author_id)
+            assert unchanged.status == "active"
+            assert unchanged.identity_revision == 1
+            assert [entry.event_type for entry in history] == ["registered"]
+        finally:
+            await database.dispose()
+
+    _run(scenario())
+
+
+def test_direct_sql_identity_audit_applies_complete_key_rotation(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        database, repository, service, _clock = await _setup(tmp_path)
+        try:
+            registration = await _register(service)
+            author_id = registration.author.author_id
+            keys = await repository.get_key_history(author_id=author_id)
+            new_fingerprint = (
+                f"sha256:{hashlib.sha256(base64.b64decode(_KEY_TWO)).hexdigest()}"
+            )
+
+            async with database.transaction() as session:
+                await session.execute(
+                    insert(AuthorKeyModel).values(
+                        id="d" * 32,
+                        author_id=author_id,
+                        public_key_b64=_KEY_TWO,
+                        fingerprint=new_fingerprint,
+                        status="pending",
+                    )
+                )
+                await session.execute(
+                    insert(AuthorIdentityAuditModel).values(
+                        id="e" * 32,
+                        author_id=author_id,
+                        transition_number=2,
+                        actor_id=_ADMIN_ACTOR,
+                        event_type="key_rotated",
+                        reason="direct database rotation",
+                        correlation_id="direct-database-rotation",
+                        idempotency_key="direct-database-rotation",
+                        prior_key_fingerprint=keys[0].fingerprint,
+                        new_key_fingerprint=new_fingerprint,
+                        prior_credential_id=None,
+                        new_credential_id=None,
+                    )
+                )
+
+            author = await repository.get_author(author_id=author_id)
+            keys = await repository.get_key_history(author_id=author_id)
+            history = await repository.get_identity_history(author_id=author_id)
+            assert author.public_key_b64 == _KEY_TWO
+            assert author.identity_revision == 2
+            assert {key.fingerprint: key.status for key in keys} == {
+                history[0].new_key_fingerprint: "revoked",
+                new_fingerprint: "active",
+            }
+            assert [entry.event_type for entry in history] == [
+                "registered",
+                "key_rotated",
+            ]
+        finally:
+            await database.dispose()
+
+    _run(scenario())
+
+
+def test_environment_backed_app_factory_exposes_author_routes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HUB_ADMIN_API_KEY", _ADMIN_KEY)
+    monkeypatch.setenv("HUB_ADMIN_ACTOR_ID", _ADMIN_ACTOR)
+    monkeypatch.setenv("HUB_AUTHOR_REGISTRATION_ENABLED", "true")
+    monkeypatch.setenv(
+        "HUB_DATABASE_URL",
+        f"sqlite:///{tmp_path / 'configured-app.db'}",
+    )
+
+    configured_app = create_configured_app()
+    paths = {route.path for route in configured_app.routes}
+    assert {
+        "/api/authors/register",
+        "/api/authors/{author_id}/keys/rotate",
+        "/api/authors/{author_id}/credentials/rotate",
+        "/api/authors/{author_id}/revoke",
+    }.issubset(paths)
+    assert isinstance(configured_app.state.hub_database, Database)
+
+    _run(configured_app.state.hub_database.dispose())
 
 
 def test_registration_endpoint_fails_closed_and_never_caches_token(

@@ -112,6 +112,13 @@ HUB_AUTHOR_REGISTRATION_ENABLED=true
 HUB_AUTHOR_TOKEN_TTL_SECONDS=2592000
 ```
 
+After applying migrations, start the environment-backed application factory:
+
+```bash
+alembic upgrade head
+uvicorn hub.web.main:create_configured_app --factory
+```
+
 The registration, key-rotation, credential-rotation, and revocation endpoints
 require the admin bearer credential plus `Idempotency-Key` and
 `X-Correlation-ID` headers. Author bearer credentials cannot call these admin

@@ -136,6 +136,12 @@ _SQLITE_SCHEMA_GUARDS = (
     BEFORE INSERT ON skill_versions
     WHEN NEW.status NOT IN ('pending_review', 'listed')
          OR (NEW.declares_tier_cd AND NEW.status = 'listed')
+         OR NOT EXISTS (
+             SELECT 1
+             FROM authors
+             WHERE id = NEW.author_id
+               AND status = 'active'
+         )
          OR NEW.revision <> 1
          OR NEW.downloads <> 0
          OR NEW.review_approved_at IS NOT NULL
@@ -230,10 +236,22 @@ _SQLITE_SCHEMA_GUARDS = (
     END
     """,
     """
+    CREATE TRIGGER IF NOT EXISTS authors_validate_initial_identity
+    BEFORE INSERT ON authors
+    WHEN NEW.status <> 'pending_registration'
+         OR NEW.identity_revision <> 1
+    BEGIN
+        SELECT RAISE(ABORT, 'author must start in pending registration');
+    END
+    """,
+    """
     CREATE TRIGGER IF NOT EXISTS authors_validate_status_transition
     BEFORE UPDATE OF status ON authors
     WHEN NEW.status <> OLD.status
-         AND NOT (OLD.status = 'active' AND NEW.status = 'revoked')
+         AND NOT (
+             (OLD.status = 'pending_registration' AND NEW.status = 'active')
+             OR (OLD.status = 'active' AND NEW.status = 'revoked')
+         )
     BEGIN
         SELECT RAISE(ABORT, 'invalid author status transition');
     END
@@ -249,7 +267,13 @@ _SQLITE_SCHEMA_GUARDS = (
     """
     CREATE TRIGGER IF NOT EXISTS authors_require_identity_revision
     BEFORE UPDATE OF status, public_key_b64 ON authors
-    WHEN NEW.identity_revision <> OLD.identity_revision + 1
+    WHEN NOT (
+             OLD.status = 'pending_registration'
+             AND NEW.status = 'active'
+             AND NEW.public_key_b64 = OLD.public_key_b64
+             AND NEW.identity_revision = OLD.identity_revision
+         )
+         AND NEW.identity_revision <> OLD.identity_revision + 1
     BEGIN
         SELECT RAISE(ABORT, 'author identity revision was not advanced');
     END
@@ -276,10 +300,130 @@ _SQLITE_SCHEMA_GUARDS = (
     END
     """,
     """
+    CREATE TRIGGER IF NOT EXISTS authors_require_identity_audit
+    BEFORE UPDATE OF status, public_key_b64, identity_revision ON authors
+    WHEN (
+             NEW.status <> OLD.status
+             OR NEW.public_key_b64 <> OLD.public_key_b64
+             OR NEW.identity_revision <> OLD.identity_revision
+         )
+         AND NOT EXISTS (
+             SELECT 1
+             FROM author_identity_audit AS audit
+             WHERE audit.author_id = OLD.id
+               AND audit.transition_number = NEW.identity_revision
+               AND (
+                   (
+                       audit.event_type = 'registered'
+                       AND OLD.status = 'pending_registration'
+                       AND NEW.status = 'active'
+                       AND NEW.public_key_b64 = OLD.public_key_b64
+                       AND NEW.identity_revision = 1
+                       AND EXISTS (
+                           SELECT 1
+                           FROM author_keys
+                           WHERE author_id = OLD.id
+                             AND fingerprint = audit.new_key_fingerprint
+                             AND public_key_b64 = NEW.public_key_b64
+                             AND status = 'active'
+                       )
+                       AND EXISTS (
+                           SELECT 1
+                           FROM author_credentials
+                           WHERE author_id = OLD.id
+                             AND id = audit.new_credential_id
+                             AND status = 'active'
+                       )
+                   )
+                   OR (
+                       audit.event_type = 'key_rotated'
+                       AND OLD.status = 'active'
+                       AND NEW.status = 'active'
+                       AND NEW.identity_revision = OLD.identity_revision + 1
+                       AND EXISTS (
+                           SELECT 1
+                           FROM author_keys
+                           WHERE author_id = OLD.id
+                             AND fingerprint = audit.prior_key_fingerprint
+                             AND public_key_b64 = OLD.public_key_b64
+                             AND status = 'revoked'
+                       )
+                       AND EXISTS (
+                           SELECT 1
+                           FROM author_keys
+                           WHERE author_id = OLD.id
+                             AND fingerprint = audit.new_key_fingerprint
+                             AND public_key_b64 = NEW.public_key_b64
+                             AND status = 'active'
+                       )
+                   )
+                   OR (
+                       audit.event_type = 'credential_rotated'
+                       AND OLD.status = 'active'
+                       AND NEW.status = 'active'
+                       AND NEW.public_key_b64 = OLD.public_key_b64
+                       AND NEW.identity_revision = OLD.identity_revision + 1
+                       AND EXISTS (
+                           SELECT 1
+                           FROM author_credentials
+                           WHERE author_id = OLD.id
+                             AND id = audit.prior_credential_id
+                             AND status = 'revoked'
+                       )
+                       AND EXISTS (
+                           SELECT 1
+                           FROM author_credentials
+                           WHERE author_id = OLD.id
+                             AND id = audit.new_credential_id
+                             AND status = 'active'
+                       )
+                   )
+                   OR (
+                       audit.event_type = 'author_revoked'
+                       AND OLD.status = 'active'
+                       AND NEW.status = 'revoked'
+                       AND NEW.public_key_b64 = OLD.public_key_b64
+                       AND NEW.identity_revision = OLD.identity_revision + 1
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM author_keys
+                           WHERE author_id = OLD.id
+                             AND status = 'active'
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM author_credentials
+                           WHERE author_id = OLD.id
+                             AND status = 'active'
+                       )
+                   )
+               )
+         )
+    BEGIN
+        SELECT RAISE(ABORT, 'author identity change requires matching audit');
+    END
+    """,
+    """
     CREATE TRIGGER IF NOT EXISTS authors_reject_identity_metadata_update
     BEFORE UPDATE OF external_subject, display_handle ON authors
     BEGIN
         SELECT RAISE(ABORT, 'author identity metadata is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS authors_reject_delete
+    BEFORE DELETE ON authors
+    BEGIN
+        SELECT RAISE(ABORT, 'author identity is append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS author_keys_validate_initial_identity
+    BEFORE INSERT ON author_keys
+    WHEN NEW.status <> 'pending'
+         OR NEW.revoked_at IS NOT NULL
+    BEGIN
+        SELECT RAISE(ABORT, 'author key must start pending');
     END
     """,
     """
@@ -307,12 +451,53 @@ _SQLITE_SCHEMA_GUARDS = (
     BEFORE UPDATE OF status ON author_keys
     WHEN NEW.status <> OLD.status
          AND NOT (
-             OLD.status = 'active'
-             AND NEW.status = 'revoked'
-             AND NEW.revoked_at IS NOT NULL
+             (OLD.status = 'pending'
+              AND NEW.status = 'active'
+              AND NEW.revoked_at IS NULL)
+             OR (OLD.status = 'active'
+                 AND NEW.status = 'revoked'
+                 AND NEW.revoked_at IS NOT NULL)
          )
     BEGIN
         SELECT RAISE(ABORT, 'invalid author key status transition');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS author_keys_require_identity_audit
+    BEFORE UPDATE OF status, revoked_at ON author_keys
+    WHEN (
+             NEW.status <> OLD.status
+             OR NEW.revoked_at IS NOT OLD.revoked_at
+         )
+         AND NOT EXISTS (
+             SELECT 1
+             FROM author_identity_audit AS audit
+             JOIN authors AS author ON author.id = OLD.author_id
+             WHERE audit.author_id = OLD.author_id
+               AND (
+                   (
+                       OLD.status = 'pending'
+                       AND NEW.status = 'active'
+                       AND audit.new_key_fingerprint = OLD.fingerprint
+                       AND (
+                           (audit.event_type = 'registered'
+                            AND audit.transition_number = 1)
+                           OR (audit.event_type = 'key_rotated'
+                               AND audit.transition_number =
+                                   author.identity_revision + 1)
+                       )
+                   )
+                   OR (
+                       OLD.status = 'active'
+                       AND NEW.status = 'revoked'
+                       AND audit.prior_key_fingerprint = OLD.fingerprint
+                       AND audit.transition_number = author.identity_revision + 1
+                       AND audit.event_type IN ('key_rotated', 'author_revoked')
+                   )
+               )
+         )
+    BEGIN
+        SELECT RAISE(ABORT, 'author key change requires matching identity audit');
     END
     """,
     """
@@ -320,6 +505,15 @@ _SQLITE_SCHEMA_GUARDS = (
     BEFORE DELETE ON author_keys
     BEGIN
         SELECT RAISE(ABORT, 'author key history is append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS author_credentials_validate_initial_identity
+    BEFORE INSERT ON author_credentials
+    WHEN NEW.status <> 'pending'
+         OR NEW.revoked_at IS NOT NULL
+    BEGIN
+        SELECT RAISE(ABORT, 'author credential must start pending');
     END
     """,
     """
@@ -331,6 +525,11 @@ _SQLITE_SCHEMA_GUARDS = (
              AND (
                  (NEW.status = 'revoked' AND NEW.revoked_at IS NOT NULL)
                  OR NEW.status = 'expired'
+             )
+             OR (
+                 OLD.status = 'pending'
+                 AND NEW.status = 'active'
+                 AND NEW.revoked_at IS NULL
              )
          )
     BEGIN
@@ -356,6 +555,50 @@ _SQLITE_SCHEMA_GUARDS = (
     )
     BEGIN
         SELECT RAISE(ABORT, 'author credential revocation timestamp is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS author_credentials_require_identity_audit
+    BEFORE UPDATE OF status, revoked_at ON author_credentials
+    WHEN (
+             NEW.status <> OLD.status
+             OR NEW.revoked_at IS NOT OLD.revoked_at
+         )
+         AND NOT EXISTS (
+             SELECT 1
+             FROM author_identity_audit AS audit
+             JOIN authors AS author ON author.id = OLD.author_id
+             WHERE audit.author_id = OLD.author_id
+               AND (
+                   (
+                       OLD.status = 'pending'
+                       AND NEW.status = 'active'
+                       AND audit.new_credential_id = OLD.id
+                       AND (
+                           (audit.event_type = 'registered'
+                            AND audit.transition_number = 1)
+                           OR (audit.event_type = 'credential_rotated'
+                               AND audit.transition_number =
+                                   author.identity_revision + 1)
+                       )
+                   )
+                   OR (
+                       OLD.status = 'active'
+                       AND NEW.status = 'revoked'
+                       AND audit.prior_credential_id = OLD.id
+                       AND audit.transition_number = author.identity_revision + 1
+                       AND audit.event_type IN (
+                           'credential_rotated',
+                           'author_revoked'
+                       )
+                   )
+               )
+         )
+    BEGIN
+        SELECT RAISE(
+            ABORT,
+            'author credential change requires matching identity audit'
+        );
     END
     """,
     """
@@ -390,49 +633,275 @@ _SQLITE_SCHEMA_GUARDS = (
     """
     CREATE TRIGGER IF NOT EXISTS author_identity_audit_validate_ownership
     BEFORE INSERT ON author_identity_audit
-    WHEN NEW.transition_number <> (
-             SELECT identity_revision
-             FROM authors
-             WHERE id = NEW.author_id
-         )
-         OR (
-             NEW.prior_key_fingerprint IS NOT NULL
+    WHEN (
+             NEW.event_type = 'registered'
              AND NOT EXISTS (
                  SELECT 1
-                 FROM author_keys
-                 WHERE author_id = NEW.author_id
-                   AND fingerprint = NEW.prior_key_fingerprint
+                 FROM authors AS author
+                 JOIN author_keys AS author_key
+                   ON author_key.author_id = author.id
+                 JOIN author_credentials AS credential
+                   ON credential.author_id = author.id
+                 WHERE author.id = NEW.author_id
+                   AND author.status = 'pending_registration'
+                   AND author.identity_revision = 1
+                   AND NEW.transition_number = 1
+                   AND author_key.fingerprint = NEW.new_key_fingerprint
+                   AND author_key.public_key_b64 = author.public_key_b64
+                   AND author_key.status = 'pending'
+                   AND credential.id = NEW.new_credential_id
+                   AND credential.status = 'pending'
+             )
+         )
+         OR (
+             NEW.event_type = 'key_rotated'
+             AND NOT EXISTS (
+                 SELECT 1
+                 FROM authors AS author
+                 JOIN author_keys AS prior_key
+                   ON prior_key.author_id = author.id
+                 JOIN author_keys AS new_key
+                   ON new_key.author_id = author.id
+                 WHERE author.id = NEW.author_id
+                   AND author.status = 'active'
+                   AND author.identity_revision + 1 = NEW.transition_number
+                   AND prior_key.fingerprint = NEW.prior_key_fingerprint
+                   AND prior_key.status = 'active'
+                   AND new_key.fingerprint = NEW.new_key_fingerprint
+                   AND new_key.status = 'pending'
+                   AND new_key.public_key_b64 <> prior_key.public_key_b64
+             )
+         )
+         OR (
+             NEW.event_type = 'credential_rotated'
+             AND NOT EXISTS (
+                 SELECT 1
+                 FROM authors AS author
+                 JOIN author_credentials AS prior_credential
+                   ON prior_credential.author_id = author.id
+                 JOIN author_credentials AS new_credential
+                   ON new_credential.author_id = author.id
+                 WHERE author.id = NEW.author_id
+                   AND author.status = 'active'
+                   AND author.identity_revision + 1 = NEW.transition_number
+                   AND prior_credential.id = NEW.prior_credential_id
+                   AND prior_credential.status = 'active'
+                   AND new_credential.id = NEW.new_credential_id
+                   AND new_credential.status = 'pending'
+                   AND new_credential.kind = prior_credential.kind
+             )
+         )
+         OR (
+             NEW.event_type = 'author_revoked'
+             AND NOT EXISTS (
+                 SELECT 1
+                 FROM authors AS author
+                 JOIN author_keys AS author_key
+                   ON author_key.author_id = author.id
+                 WHERE author.id = NEW.author_id
+                   AND author.status = 'active'
+                   AND author.identity_revision + 1 = NEW.transition_number
+                   AND author_key.fingerprint = NEW.prior_key_fingerprint
+                   AND author_key.status = 'active'
+                   AND (
+                       (
+                           NEW.prior_credential_id IS NULL
+                           AND NOT EXISTS (
+                               SELECT 1
+                               FROM author_credentials
+                               WHERE author_id = author.id
+                                 AND status = 'active'
+                           )
+                       )
+                       OR EXISTS (
+                           SELECT 1
+                           FROM author_credentials
+                           WHERE author_id = author.id
+                             AND id = NEW.prior_credential_id
+                             AND status = 'active'
+                       )
+                   )
              )
          )
          OR (
              NEW.new_key_fingerprint IS NOT NULL
-             AND NOT EXISTS (
+             AND EXISTS (
                  SELECT 1
                  FROM author_keys
-                 WHERE author_id = NEW.author_id
-                   AND fingerprint = NEW.new_key_fingerprint
-             )
-         )
-         OR (
-             NEW.prior_credential_id IS NOT NULL
-             AND NOT EXISTS (
-                 SELECT 1
-                 FROM author_credentials
-                 WHERE author_id = NEW.author_id
-                   AND id = NEW.prior_credential_id
+                 WHERE fingerprint = NEW.new_key_fingerprint
+                   AND author_id <> NEW.author_id
              )
          )
          OR (
              NEW.new_credential_id IS NOT NULL
-             AND NOT EXISTS (
+             AND EXISTS (
                  SELECT 1
                  FROM author_credentials
-                 WHERE author_id = NEW.author_id
-                   AND id = NEW.new_credential_id
+                 WHERE id = NEW.new_credential_id
+                   AND author_id <> NEW.author_id
              )
          )
     BEGIN
         SELECT RAISE(ABORT, 'identity audit references invalid author state');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS author_identity_audit_apply_registration
+    AFTER INSERT ON author_identity_audit
+    WHEN NEW.event_type = 'registered'
+    BEGIN
+        UPDATE author_keys
+        SET status = 'active'
+        WHERE author_id = NEW.author_id
+          AND fingerprint = NEW.new_key_fingerprint
+          AND status = 'pending';
+        SELECT CASE
+            WHEN changes() <> 1
+            THEN RAISE(ABORT, 'registration did not activate author key')
+        END;
+
+        UPDATE author_credentials
+        SET status = 'active'
+        WHERE author_id = NEW.author_id
+          AND id = NEW.new_credential_id
+          AND status = 'pending';
+        SELECT CASE
+            WHEN changes() <> 1
+            THEN RAISE(ABORT, 'registration did not activate author credential')
+        END;
+
+        UPDATE authors
+        SET status = 'active',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = NEW.author_id
+          AND status = 'pending_registration'
+          AND identity_revision = 1;
+        SELECT CASE
+            WHEN changes() <> 1
+            THEN RAISE(ABORT, 'registration did not activate author')
+        END;
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS author_identity_audit_apply_key_rotation
+    AFTER INSERT ON author_identity_audit
+    WHEN NEW.event_type = 'key_rotated'
+    BEGIN
+        UPDATE author_keys
+        SET status = 'revoked',
+            revoked_at = NEW.occurred_at
+        WHERE author_id = NEW.author_id
+          AND fingerprint = NEW.prior_key_fingerprint
+          AND status = 'active';
+        SELECT CASE
+            WHEN changes() <> 1
+            THEN RAISE(ABORT, 'key rotation did not revoke prior key')
+        END;
+
+        UPDATE author_keys
+        SET status = 'active'
+        WHERE author_id = NEW.author_id
+          AND fingerprint = NEW.new_key_fingerprint
+          AND status = 'pending';
+        SELECT CASE
+            WHEN changes() <> 1
+            THEN RAISE(ABORT, 'key rotation did not activate new key')
+        END;
+
+        UPDATE authors
+        SET public_key_b64 = (
+                SELECT public_key_b64
+                FROM author_keys
+                WHERE author_id = NEW.author_id
+                  AND fingerprint = NEW.new_key_fingerprint
+            ),
+            identity_revision = NEW.transition_number,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = NEW.author_id
+          AND status = 'active'
+          AND identity_revision + 1 = NEW.transition_number;
+        SELECT CASE
+            WHEN changes() <> 1
+            THEN RAISE(ABORT, 'key rotation did not advance author identity')
+        END;
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS author_identity_audit_apply_credential_rotation
+    AFTER INSERT ON author_identity_audit
+    WHEN NEW.event_type = 'credential_rotated'
+    BEGIN
+        UPDATE author_credentials
+        SET status = 'revoked',
+            revoked_at = NEW.occurred_at
+        WHERE author_id = NEW.author_id
+          AND id = NEW.prior_credential_id
+          AND status = 'active';
+        SELECT CASE
+            WHEN changes() <> 1
+            THEN RAISE(ABORT, 'credential rotation did not revoke prior credential')
+        END;
+
+        UPDATE author_credentials
+        SET status = 'active'
+        WHERE author_id = NEW.author_id
+          AND id = NEW.new_credential_id
+          AND status = 'pending';
+        SELECT CASE
+            WHEN changes() <> 1
+            THEN RAISE(ABORT, 'credential rotation did not activate new credential')
+        END;
+
+        UPDATE authors
+        SET identity_revision = NEW.transition_number,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = NEW.author_id
+          AND status = 'active'
+          AND identity_revision + 1 = NEW.transition_number;
+        SELECT CASE
+            WHEN changes() <> 1
+            THEN RAISE(ABORT, 'credential rotation did not advance author identity')
+        END;
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS author_identity_audit_apply_revocation
+    AFTER INSERT ON author_identity_audit
+    WHEN NEW.event_type = 'author_revoked'
+    BEGIN
+        UPDATE author_keys
+        SET status = 'revoked',
+            revoked_at = NEW.occurred_at
+        WHERE author_id = NEW.author_id
+          AND fingerprint = NEW.prior_key_fingerprint
+          AND status = 'active';
+        SELECT CASE
+            WHEN changes() <> 1
+            THEN RAISE(ABORT, 'author revocation did not revoke active key')
+        END;
+
+        UPDATE author_credentials
+        SET status = 'revoked',
+            revoked_at = NEW.occurred_at
+        WHERE author_id = NEW.author_id
+          AND id = NEW.prior_credential_id
+          AND status = 'active';
+        SELECT CASE
+            WHEN NEW.prior_credential_id IS NOT NULL AND changes() <> 1
+            THEN RAISE(ABORT, 'author revocation did not revoke credential')
+        END;
+
+        UPDATE authors
+        SET status = 'revoked',
+            identity_revision = NEW.transition_number,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = NEW.author_id
+          AND status = 'active'
+          AND identity_revision + 1 = NEW.transition_number;
+        SELECT CASE
+            WHEN changes() <> 1
+            THEN RAISE(ABORT, 'author revocation did not advance author identity')
+        END;
     END
     """,
 )
@@ -475,7 +944,10 @@ class AuthorModel(Base):
         CheckConstraint("length(external_subject) > 0", name="external_subject_set"),
         CheckConstraint("length(display_handle) > 0", name="display_handle_set"),
         CheckConstraint("length(public_key_b64) > 0", name="public_key_set"),
-        CheckConstraint("status IN ('active', 'revoked')", name="status_valid"),
+        CheckConstraint(
+            "status IN ('pending_registration', 'active', 'revoked')",
+            name="status_valid",
+        ),
         CheckConstraint("identity_revision >= 1", name="identity_revision_positive"),
     )
 
@@ -484,7 +956,10 @@ class AuthorModel(Base):
     display_handle: Mapped[str] = mapped_column(String(255), unique=True)
     public_key_b64: Mapped[str] = mapped_column(String(255), unique=True)
     status: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="active", server_default="active"
+        String(24),
+        nullable=False,
+        default="pending_registration",
+        server_default="pending_registration",
     )
     identity_revision: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default="1"
@@ -512,10 +987,12 @@ class AuthorCredentialModel(Base):
             name="credential_hash_valid",
         ),
         CheckConstraint(
-            "status IN ('active', 'revoked', 'expired')", name="status_valid"
+            "status IN ('pending', 'active', 'revoked', 'expired')",
+            name="status_valid",
         ),
         CheckConstraint(
-            "(status = 'active' AND revoked_at IS NULL) "
+            "(status = 'pending' AND revoked_at IS NULL) "
+            "OR (status = 'active' AND revoked_at IS NULL) "
             "OR (status = 'revoked' AND revoked_at IS NOT NULL) "
             "OR (status = 'expired' AND revoked_at IS NULL)",
             name="revocation_state_valid",
@@ -540,7 +1017,7 @@ class AuthorCredentialModel(Base):
         String(71), nullable=False, unique=True
     )
     status: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="active", server_default="active"
+        String(16), nullable=False, default="pending", server_default="pending"
     )
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -559,9 +1036,12 @@ class AuthorKeyModel(Base):
             "fingerprint LIKE 'sha256:%' AND length(fingerprint) = 71",
             name="fingerprint_valid",
         ),
-        CheckConstraint("status IN ('active', 'revoked')", name="status_valid"),
         CheckConstraint(
-            "(status = 'active' AND revoked_at IS NULL) "
+            "status IN ('pending', 'active', 'revoked')", name="status_valid"
+        ),
+        CheckConstraint(
+            "(status = 'pending' AND revoked_at IS NULL) "
+            "OR (status = 'active' AND revoked_at IS NULL) "
             "OR (status = 'revoked' AND revoked_at IS NOT NULL)",
             name="revocation_state_valid",
         ),
@@ -583,7 +1063,7 @@ class AuthorKeyModel(Base):
     )
     fingerprint: Mapped[str] = mapped_column(String(71), nullable=False, unique=True)
     status: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="active", server_default="active"
+        String(16), nullable=False, default="pending", server_default="pending"
     )
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
@@ -657,7 +1137,13 @@ class AuthorIdentityAuditModel(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_record_id)
     author_id: Mapped[str] = mapped_column(
-        ForeignKey("authors.id", ondelete="RESTRICT"), nullable=False
+        ForeignKey(
+            "authors.id",
+            ondelete="RESTRICT",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        nullable=False,
     )
     transition_number: Mapped[int] = mapped_column(Integer, nullable=False)
     actor_id: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -668,13 +1154,39 @@ class AuthorIdentityAuditModel(Base):
     )
     correlation_id: Mapped[str] = mapped_column(String(255), nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
-    prior_key_fingerprint: Mapped[str | None] = mapped_column(String(71))
-    new_key_fingerprint: Mapped[str | None] = mapped_column(String(71))
+    prior_key_fingerprint: Mapped[str | None] = mapped_column(
+        String(71),
+        ForeignKey(
+            "author_keys.fingerprint",
+            ondelete="RESTRICT",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+    )
+    new_key_fingerprint: Mapped[str | None] = mapped_column(
+        String(71),
+        ForeignKey(
+            "author_keys.fingerprint",
+            ondelete="RESTRICT",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+    )
     prior_credential_id: Mapped[str | None] = mapped_column(
-        ForeignKey("author_credentials.id", ondelete="RESTRICT")
+        ForeignKey(
+            "author_credentials.id",
+            ondelete="RESTRICT",
+            deferrable=True,
+            initially="DEFERRED",
+        )
     )
     new_credential_id: Mapped[str | None] = mapped_column(
-        ForeignKey("author_credentials.id", ondelete="RESTRICT")
+        ForeignKey(
+            "author_credentials.id",
+            ondelete="RESTRICT",
+            deferrable=True,
+            initially="DEFERRED",
+        )
     )
 
 

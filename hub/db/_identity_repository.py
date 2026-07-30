@@ -6,9 +6,8 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import NoReturn
 
-from sqlalchemy import func, select, update
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -121,6 +120,8 @@ class AuthorIdentityRepository:
                 await session.flush()
                 session.add(audit)
                 await session.flush()
+                await session.refresh(author)
+                await session.refresh(credential)
         except IntegrityError as exc:
             raise _conflict("author registration") from exc
         return author, credential
@@ -157,21 +158,6 @@ class AuthorIdentityRepository:
                         "new author key must differ from the active key"
                     )
 
-                revoked_key = await session.execute(
-                    update(AuthorKeyModel)
-                    .where(
-                        AuthorKeyModel.id == current_key.id,
-                        AuthorKeyModel.status == "active",
-                    )
-                    .values(
-                        status="revoked",
-                        revoked_at=func.current_timestamp(),
-                    )
-                    .returning(AuthorKeyModel.id)
-                )
-                if revoked_key.scalar_one_or_none() is None:
-                    self._raise_concurrent_identity_change()
-
                 session.add(
                     AuthorKeyModel(
                         id=new_record_id(),
@@ -181,17 +167,11 @@ class AuthorIdentityRepository:
                     )
                 )
                 await session.flush()
-
-                updated_author = await self._advance_author(
-                    session=session,
-                    author=author,
-                    values={"public_key_b64": clean_public_key},
-                )
                 session.add(
                     AuthorIdentityAuditModel(
                         id=new_record_id(),
                         author_id=author.id,
-                        transition_number=updated_author.identity_revision,
+                        transition_number=author.identity_revision + 1,
                         actor_id=actor_id,
                         event_type="key_rotated",
                         reason=clean_reason,
@@ -204,6 +184,8 @@ class AuthorIdentityRepository:
                     )
                 )
                 await session.flush()
+                await session.refresh(author)
+                updated_author = author
         except IntegrityError as exc:
             raise _conflict("author key rotation") from exc
         return updated_author
@@ -246,33 +228,13 @@ class AuthorIdentityRepository:
                     author_id=author.id,
                     credential_kind=clean_kind,
                 )
-                revoked_credential = await session.execute(
-                    update(AuthorCredentialModel)
-                    .where(
-                        AuthorCredentialModel.id == current_credential.id,
-                        AuthorCredentialModel.status == "active",
-                    )
-                    .values(
-                        status="revoked",
-                        revoked_at=func.current_timestamp(),
-                    )
-                    .returning(AuthorCredentialModel.id)
-                )
-                if revoked_credential.scalar_one_or_none() is None:
-                    self._raise_concurrent_identity_change()
-
                 session.add(credential)
                 await session.flush()
-                updated_author = await self._advance_author(
-                    session=session,
-                    author=author,
-                    values={},
-                )
                 session.add(
                     AuthorIdentityAuditModel(
                         id=new_record_id(),
                         author_id=author.id,
-                        transition_number=updated_author.identity_revision,
+                        transition_number=author.identity_revision + 1,
                         actor_id=actor_id,
                         event_type="credential_rotated",
                         reason=clean_reason,
@@ -285,6 +247,9 @@ class AuthorIdentityRepository:
                     )
                 )
                 await session.flush()
+                await session.refresh(author)
+                await session.refresh(credential)
+                updated_author = author
         except IntegrityError as exc:
             raise _conflict("author credential rotation") from exc
         return updated_author, credential
@@ -319,38 +284,11 @@ class AuthorIdentityRepository:
                     author_id=author.id,
                     credential_kind=clean_kind,
                 )
-                await session.execute(
-                    update(AuthorKeyModel)
-                    .where(
-                        AuthorKeyModel.author_id == author.id,
-                        AuthorKeyModel.status == "active",
-                    )
-                    .values(
-                        status="revoked",
-                        revoked_at=func.current_timestamp(),
-                    )
-                )
-                await session.execute(
-                    update(AuthorCredentialModel)
-                    .where(
-                        AuthorCredentialModel.author_id == author.id,
-                        AuthorCredentialModel.status == "active",
-                    )
-                    .values(
-                        status="revoked",
-                        revoked_at=func.current_timestamp(),
-                    )
-                )
-                updated_author = await self._advance_author(
-                    session=session,
-                    author=author,
-                    values={"status": "revoked"},
-                )
                 session.add(
                     AuthorIdentityAuditModel(
                         id=new_record_id(),
                         author_id=author.id,
-                        transition_number=updated_author.identity_revision,
+                        transition_number=author.identity_revision + 1,
                         actor_id=actor_id,
                         event_type="author_revoked",
                         reason=clean_reason,
@@ -367,6 +305,8 @@ class AuthorIdentityRepository:
                     )
                 )
                 await session.flush()
+                await session.refresh(author)
+                updated_author = author
         except IntegrityError as exc:
             raise _conflict("author revocation") from exc
         return updated_author
@@ -437,32 +377,6 @@ class AuthorIdentityRepository:
             )
             return list(result)
 
-    async def _advance_author(
-        self,
-        *,
-        session: AsyncSession,
-        author: AuthorModel,
-        values: dict[str, object],
-    ) -> AuthorModel:
-        result = await session.execute(
-            update(AuthorModel)
-            .where(
-                AuthorModel.id == author.id,
-                AuthorModel.status == "active",
-                AuthorModel.identity_revision == author.identity_revision,
-            )
-            .values(
-                **values,
-                identity_revision=AuthorModel.identity_revision + 1,
-                updated_at=func.current_timestamp(),
-            )
-            .returning(AuthorModel)
-        )
-        updated_author = result.scalar_one_or_none()
-        if updated_author is None:
-            self._raise_concurrent_identity_change()
-        return updated_author
-
     async def _get_active_author(
         self, *, session: AsyncSession, author_id: str
     ) -> AuthorModel:
@@ -521,8 +435,3 @@ class AuthorIdentityRepository:
             )
         )
         return result.one_or_none()
-
-    def _raise_concurrent_identity_change(self) -> NoReturn:
-        raise InvalidStateTransitionError(
-            "author identity changed concurrently; retry with a new idempotency key"
-        )

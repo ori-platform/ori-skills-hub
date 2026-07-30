@@ -30,6 +30,7 @@ from hub.db import (
 )
 from hub.db._models import (
     ArtifactModel,
+    AuthorModel,
     SkillTransitionAuditModel,
     SkillVersionModel,
     new_record_id,
@@ -166,17 +167,28 @@ def test_alembic_upgrade_is_repeatable(
         "author_credentials_reject_delete",
         "author_credentials_reject_identity_update",
         "author_credentials_reject_revoked_at_rewrite",
+        "author_credentials_require_identity_audit",
+        "author_credentials_validate_initial_identity",
         "author_credentials_validate_status_transition",
         "author_identity_audit_reject_delete",
         "author_identity_audit_reject_update",
+        "author_identity_audit_apply_credential_rotation",
+        "author_identity_audit_apply_key_rotation",
+        "author_identity_audit_apply_registration",
+        "author_identity_audit_apply_revocation",
         "author_identity_audit_validate_ownership",
         "author_identity_audit_validate_timestamp",
         "author_keys_reject_delete",
         "author_keys_reject_identity_update",
         "author_keys_reject_revoked_at_rewrite",
+        "author_keys_require_identity_audit",
+        "author_keys_validate_initial_identity",
         "author_keys_validate_status_transition",
+        "authors_reject_delete",
         "authors_reject_identity_metadata_update",
+        "authors_require_identity_audit",
         "authors_require_identity_revision",
+        "authors_validate_initial_identity",
         "authors_validate_identity_revision",
         "authors_validate_key_rotation",
         "authors_validate_status_transition",
@@ -356,6 +368,67 @@ def test_failed_publication_rolls_back_its_artifact(tmp_path: Path) -> None:
                 artifact_count = await session.scalar(
                     select(func.count()).select_from(ArtifactModel)
                 )
+            assert artifact_count == 0
+        finally:
+            await database.dispose()
+
+    _run(scenario())
+
+
+def test_pending_and_revoked_authors_cannot_publish(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database, repository, active_author_id = await _setup_repository(tmp_path)
+        pending_author_id = new_record_id()
+        try:
+            async with database.transaction() as session:
+                await session.execute(
+                    insert(AuthorModel).values(
+                        id=pending_author_id,
+                        external_subject="github:pending",
+                        display_handle="pending-author",
+                        public_key_b64="pending-public-key",
+                        status="pending_registration",
+                        identity_revision=1,
+                    )
+                )
+
+            with pytest.raises(PersistenceConflictError):
+                await _publish(
+                    repository,
+                    author_id=pending_author_id,
+                    name="pending-author-skill",
+                    digest_character="d",
+                    idempotency_key="pending-author-publication",
+                )
+
+            identity_service = AuthorIdentityService(
+                database,
+                token_ttl_seconds=300,
+            )
+            await identity_service.revoke(
+                author_id=active_author_id,
+                authenticated_actor_id="test-bootstrap",
+                reason="test author revocation",
+                correlation_id="test-author-revocation",
+                idempotency_key="test-author-revocation",
+            )
+            with pytest.raises(PersistenceConflictError):
+                await _publish(
+                    repository,
+                    author_id=active_author_id,
+                    name="revoked-author-skill",
+                    digest_character="e",
+                    idempotency_key="revoked-author-publication",
+                )
+
+            async with database.transaction() as session:
+                skill_count = await session.scalar(
+                    select(func.count()).select_from(SkillVersionModel)
+                )
+                artifact_count = await session.scalar(
+                    select(func.count()).select_from(ArtifactModel)
+                )
+            assert skill_count == 0
             assert artifact_count == 0
         finally:
             await database.dispose()
@@ -591,18 +664,36 @@ def test_alembic_schema_blocks_direct_sql_review_gate_bypasses(
     async def scenario() -> None:
         database = Database(f"sqlite:///{database_path}")
         repository = HubRepository(database)
+        identity_service = AuthorIdentityService(
+            database,
+            token_ttl_seconds=300,
+        )
         try:
-            author = await repository.create_author(
+            registration = await identity_service.register(
                 external_subject="github:migrated",
                 display_handle="migrated-author",
-                public_key_b64="migrated-author-public-key",
+                public_key_b64=_AUTHOR_PUBLIC_KEY,
+                authenticated_actor_id="test-migrated-bootstrap",
+                correlation_id="test-migrated-bootstrap",
+                idempotency_key="test-migrated-bootstrap",
             )
             skill = await _publish(
                 repository,
-                author_id=author.id,
+                author_id=registration.author.author_id,
                 declares_tier_cd=True,
                 initial_status=SkillStatus.PENDING_REVIEW,
             )
+
+            with pytest.raises(IntegrityError, match="matching audit"):
+                async with database.transaction() as session:
+                    await session.execute(
+                        update(AuthorModel)
+                        .where(AuthorModel.id == registration.author.author_id)
+                        .values(
+                            status="revoked",
+                            identity_revision=2,
+                        )
+                    )
 
             with pytest.raises(IntegrityError, match="matching audit"):
                 async with database.transaction() as session:
