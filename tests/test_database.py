@@ -157,8 +157,15 @@ def test_alembic_upgrade_is_repeatable(
         "artifacts_reject_update",
         "skill_transition_audit_reject_delete",
         "skill_transition_audit_reject_update",
+        "skill_transition_audit_apply_listing",
+        "skill_transition_audit_apply_nonlisting",
+        "skill_transition_audit_validate_state",
         "skill_transition_audit_validate_timestamp",
+        "skill_versions_reject_approval_update",
+        "skill_versions_reject_identity_authority_update",
+        "skill_versions_require_transition_audit",
         "skill_versions_validate_initial_status",
+        "skill_versions_validate_revision_transition",
         "skill_versions_validate_status_transition",
     }
 
@@ -237,6 +244,45 @@ def test_publication_writes_artifact_skill_and_initial_audit_atomically(
     _run(scenario())
 
 
+def test_initial_publication_requires_matching_initial_audit(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database, _repository, author_id = await _setup_repository(tmp_path)
+        artifact_id = new_record_id()
+        try:
+            with pytest.raises(IntegrityError, match="invalid initial skill status"):
+                async with database.transaction() as session:
+                    await session.execute(
+                        insert(ArtifactModel).values(
+                            id=artifact_id,
+                            artifact_digest=_ARTIFACT_DIGEST,
+                            manifest_digest=_MANIFEST_DIGEST,
+                            storage_key="missing-audit/1.0.0/artifact.tar.gz",
+                            byte_size=128,
+                            artifact_signature="artifact-signature",
+                            manifest_signature="manifest-signature",
+                        )
+                    )
+                    await session.execute(
+                        insert(SkillVersionModel).values(
+                            id=new_record_id(),
+                            name="missing-audit",
+                            version="1.0.0",
+                            author_id=author_id,
+                            artifact_id=artifact_id,
+                            status=SkillStatus.LISTED.value,
+                            declares_tier_cd=False,
+                        )
+                    )
+
+            async with database.transaction() as session:
+                artifact = await session.get(ArtifactModel, artifact_id)
+                assert artifact is None
+        finally:
+            await database.dispose()
+
+    _run(scenario())
+
+
 def test_failed_publication_rolls_back_its_artifact(tmp_path: Path) -> None:
     async def scenario() -> None:
         database, repository, _author_id = await _setup_repository(tmp_path)
@@ -301,12 +347,27 @@ def test_tier_cd_cannot_be_listed_without_review(tmp_path: Path) -> None:
                 initial_status=SkillStatus.PENDING_REVIEW,
             )
             async with database.transaction() as session:
-                with pytest.raises(IntegrityError):
+                with pytest.raises(IntegrityError, match="matching audit"):
                     await session.execute(
                         update(SkillVersionModel)
                         .where(SkillVersionModel.id == skill.id)
-                        .values(status=SkillStatus.LISTED.value)
+                        .values(
+                            status=SkillStatus.LISTED.value,
+                            revision=2,
+                            review_approved_at=func.current_timestamp(),
+                            review_approved_by="forged-reviewer",
+                        )
                     )
+
+            stored = await repository.get_skill(name="energy", version="1.0.0")
+            history = await repository.get_transition_history(
+                name="energy", version="1.0.0"
+            )
+            assert stored.status == SkillStatus.PENDING_REVIEW.value
+            assert stored.review_approved_at is None
+            assert stored.review_approved_by is None
+            assert stored.revision == 1
+            assert [entry.new_status for entry in history] == ["pending_review"]
 
             artifact_id = new_record_id()
             with pytest.raises(IntegrityError, match="invalid initial skill status"):
@@ -335,6 +396,183 @@ def test_tier_cd_cannot_be_listed_without_review(tmp_path: Path) -> None:
                             review_approved_by="forged-reviewer",
                         )
                     )
+        finally:
+            await database.dispose()
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement"),
+    [
+        ("id", "f" * 32),
+        ("name", "renamed"),
+        ("version", "9.9.9"),
+        ("author_id", "e" * 32),
+        ("artifact_id", "d" * 32),
+        ("declares_tier_cd", False),
+    ],
+)
+def test_direct_sql_publication_identity_and_authority_are_immutable(
+    tmp_path: Path,
+    field_name: str,
+    replacement: str | bool,
+) -> None:
+    async def scenario() -> None:
+        database, repository, author_id = await _setup_repository(tmp_path)
+        try:
+            skill = await _publish(
+                repository,
+                author_id=author_id,
+                declares_tier_cd=True,
+                initial_status=SkillStatus.PENDING_REVIEW,
+            )
+            with pytest.raises(IntegrityError, match="identity and authority"):
+                async with database.transaction() as session:
+                    await session.execute(
+                        update(SkillVersionModel)
+                        .where(SkillVersionModel.id == skill.id)
+                        .values({field_name: replacement})
+                    )
+
+            unchanged = await repository.get_skill(name="energy", version="1.0.0")
+            assert unchanged.id == skill.id
+            assert unchanged.name == "energy"
+            assert unchanged.version == "1.0.0"
+            assert unchanged.author_id == author_id
+            assert unchanged.artifact_id == skill.artifact_id
+            assert unchanged.declares_tier_cd is True
+        finally:
+            await database.dispose()
+
+    _run(scenario())
+
+
+def test_direct_sql_audit_is_validated_and_applies_transition_atomically(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        database, repository, author_id = await _setup_repository(tmp_path)
+        try:
+            skill = await _publish(
+                repository,
+                author_id=author_id,
+                declares_tier_cd=True,
+                initial_status=SkillStatus.PENDING_REVIEW,
+            )
+            audit_values = {
+                "skill_version_id": skill.id,
+                "transition_number": 2,
+                "actor_id": "reviewer:direct-sql",
+                "prior_status": SkillStatus.PENDING_REVIEW.value,
+                "new_status": SkillStatus.LISTED.value,
+                "reason": "manual Tier C/D review passed",
+                "correlation_id": "review:direct-sql",
+                "idempotency_key": "review:direct-sql",
+                "manifest_digest": _MANIFEST_DIGEST,
+            }
+
+            with pytest.raises(IntegrityError, match="current skill state"):
+                async with database.transaction() as session:
+                    await session.execute(
+                        insert(SkillTransitionAuditModel).values(
+                            id=new_record_id(),
+                            artifact_digest=f"sha256:{'d' * 64}",
+                            **audit_values,
+                        )
+                    )
+
+            unchanged = await repository.get_skill(name="energy", version="1.0.0")
+            history = await repository.get_transition_history(
+                name="energy", version="1.0.0"
+            )
+            assert unchanged.status == SkillStatus.PENDING_REVIEW.value
+            assert unchanged.revision == 1
+            assert [entry.new_status for entry in history] == ["pending_review"]
+
+            async with database.transaction() as session:
+                await session.execute(
+                    insert(SkillTransitionAuditModel).values(
+                        id=new_record_id(),
+                        artifact_digest=_ARTIFACT_DIGEST,
+                        **audit_values,
+                    )
+                )
+
+            approved = await repository.get_skill(name="energy", version="1.0.0")
+            history = await repository.get_transition_history(
+                name="energy", version="1.0.0"
+            )
+            assert approved.status == SkillStatus.LISTED.value
+            assert approved.revision == 2
+            assert approved.review_approved_by == "reviewer:direct-sql"
+            assert approved.review_approved_at == history[-1].occurred_at
+            assert [entry.new_status for entry in history] == [
+                "pending_review",
+                "listed",
+            ]
+        finally:
+            await database.dispose()
+
+    _run(scenario())
+
+
+def test_alembic_schema_blocks_direct_sql_review_gate_bypasses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "migrated-guards.db"
+    monkeypatch.setenv("HUB_DATABASE_URL", f"sqlite:///{database_path}")
+    config = Config(str(Path(__file__).parents[1] / "alembic.ini"))
+    command.upgrade(config, "head")
+
+    async def scenario() -> None:
+        database = Database(f"sqlite:///{database_path}")
+        repository = HubRepository(database)
+        try:
+            author = await repository.create_author(
+                external_subject="github:migrated",
+                display_handle="migrated-author",
+                public_key_b64="migrated-author-public-key",
+            )
+            skill = await _publish(
+                repository,
+                author_id=author.id,
+                declares_tier_cd=True,
+                initial_status=SkillStatus.PENDING_REVIEW,
+            )
+
+            with pytest.raises(IntegrityError, match="matching audit"):
+                async with database.transaction() as session:
+                    await session.execute(
+                        update(SkillVersionModel)
+                        .where(SkillVersionModel.id == skill.id)
+                        .values(
+                            status=SkillStatus.LISTED.value,
+                            revision=2,
+                            review_approved_at=func.current_timestamp(),
+                            review_approved_by="forged-reviewer",
+                        )
+                    )
+
+            with pytest.raises(IntegrityError, match="identity and authority"):
+                async with database.transaction() as session:
+                    await session.execute(
+                        update(SkillVersionModel)
+                        .where(SkillVersionModel.id == skill.id)
+                        .values(declares_tier_cd=False)
+                    )
+
+            unchanged = await repository.get_skill(name="energy", version="1.0.0")
+            history = await repository.get_transition_history(
+                name="energy", version="1.0.0"
+            )
+            assert unchanged.status == SkillStatus.PENDING_REVIEW.value
+            assert unchanged.declares_tier_cd is True
+            assert unchanged.review_approved_at is None
+            assert unchanged.review_approved_by is None
+            assert unchanged.revision == 1
+            assert [entry.new_status for entry in history] == ["pending_review"]
         finally:
             await database.dispose()
 
@@ -386,6 +624,58 @@ def test_review_and_unlist_retain_complete_server_owned_history(
                 ("listed", "unlisted", "reviewer:84"),
             ]
             assert all(entry.occurred_at is not None for entry in history)
+        finally:
+            await database.dispose()
+
+    _run(scenario())
+
+
+def test_review_metadata_and_revision_cannot_diverge_from_audit(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        database, repository, author_id = await _setup_repository(tmp_path)
+        try:
+            await _publish(
+                repository,
+                author_id=author_id,
+                declares_tier_cd=True,
+                initial_status=SkillStatus.PENDING_REVIEW,
+            )
+            approved = await repository.transition_skill(
+                name="energy",
+                version="1.0.0",
+                target_status=SkillStatus.LISTED,
+                authenticated_actor_id="reviewer:42",
+                reason="manual Tier C/D review passed",
+                correlation_id="review:energy:1.0.0",
+                idempotency_key="approve-energy-1.0.0",
+            )
+
+            with pytest.raises(IntegrityError, match="approval metadata"):
+                async with database.transaction() as session:
+                    await session.execute(
+                        update(SkillVersionModel)
+                        .where(SkillVersionModel.id == approved.id)
+                        .values(review_approved_by="forged-reviewer")
+                    )
+
+            with pytest.raises(IntegrityError, match="revision transition"):
+                async with database.transaction() as session:
+                    await session.execute(
+                        update(SkillVersionModel)
+                        .where(SkillVersionModel.id == approved.id)
+                        .values(revision=approved.revision + 1)
+                    )
+
+            unchanged = await repository.get_skill(name="energy", version="1.0.0")
+            history = await repository.get_transition_history(
+                name="energy", version="1.0.0"
+            )
+            assert unchanged.review_approved_by == "reviewer:42"
+            assert unchanged.review_approved_at == history[-1].occurred_at
+            assert unchanged.revision == 2
+            assert len(history) == 2
         finally:
             await database.dispose()
 
@@ -494,6 +784,21 @@ def test_direct_orm_status_changes_cannot_bypass_atomic_audit(
                 stored.status = SkillStatus.REJECTED.value
                 with pytest.raises(InvalidStateTransitionError, match="HubRepository"):
                     await session.flush()
+
+            async with database.transaction() as session:
+                stored = await session.get(SkillVersionModel, skill.id)
+                assert stored is not None
+                stored.declares_tier_cd = False
+                with pytest.raises(InvalidStateTransitionError, match="HubRepository"):
+                    await session.flush()
+
+            unchanged = await repository.get_skill(name="energy", version="1.0.0")
+            history = await repository.get_transition_history(
+                name="energy", version="1.0.0"
+            )
+            assert unchanged.status == SkillStatus.PENDING_REVIEW.value
+            assert unchanged.declares_tier_cd is True
+            assert [entry.new_status for entry in history] == ["pending_review"]
         finally:
             await database.dispose()
 
@@ -783,7 +1088,25 @@ def test_database_checks_reject_invalid_states_and_physical_history_deletion(
                         .values(status="unknown")
                     )
 
-            with pytest.raises(IntegrityError, match="invalid skill status transition"):
+            with pytest.raises(IntegrityError, match="current skill state"):
+                async with database.transaction() as session:
+                    await session.execute(
+                        insert(SkillTransitionAuditModel).values(
+                            id=new_record_id(),
+                            skill_version_id=skill.id,
+                            transition_number=2,
+                            actor_id="reviewer:42",
+                            prior_status=SkillStatus.LISTED.value,
+                            new_status=SkillStatus.REJECTED.value,
+                            reason="invalid transition",
+                            correlation_id="invalid-transition",
+                            idempotency_key="invalid-transition",
+                            artifact_digest=_ARTIFACT_DIGEST,
+                            manifest_digest=_MANIFEST_DIGEST,
+                        )
+                    )
+
+            with pytest.raises(IntegrityError, match="matching audit"):
                 async with database.transaction() as session:
                     await session.execute(
                         update(SkillVersionModel)

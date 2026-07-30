@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import NoReturn
 
-from sqlalchemy import func, select, update
+from sqlalchemy import insert, literal, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -188,9 +188,9 @@ class HubRepository:
             async with self._database.transaction() as session:
                 session.add(artifact)
                 await session.flush()
-                session.add(skill)
-                await session.flush()
                 session.add(audit)
+                await session.flush()
+                session.add(skill)
                 await session.flush()
         except IntegrityError as exc:
             raise _conflict("skill publication", exc) from exc
@@ -213,62 +213,75 @@ class HubRepository:
                 f"skills cannot transition to {target_status.value}"
             )
 
+        clean_name = _required(name, "name")
+        clean_version = _required(version, "version")
         actor_id = _required(authenticated_actor_id, "authenticated_actor_id")
-        values: dict[str, object] = {
-            "status": target_status.value,
-            "revision": SkillVersionModel.revision + 1,
-            "updated_at": func.current_timestamp(),
-        }
-        if target_status is SkillStatus.LISTED:
-            values.update(
-                review_approved_at=func.current_timestamp(),
-                review_approved_by=actor_id,
+        clean_reason = _required(reason, "reason")
+        clean_correlation_id = _required(correlation_id, "correlation_id")
+        clean_idempotency_key = _required(idempotency_key, "idempotency_key")
+        audit_id = new_record_id()
+        transition = (
+            select(
+                literal(audit_id),
+                SkillVersionModel.id,
+                SkillVersionModel.revision + 1,
+                literal(actor_id),
+                literal(prior_status.value),
+                literal(target_status.value),
+                literal(clean_reason),
+                literal(clean_correlation_id),
+                literal(clean_idempotency_key),
+                ArtifactModel.artifact_digest,
+                ArtifactModel.manifest_digest,
             )
-
-        statement = (
-            update(SkillVersionModel)
+            .join(
+                ArtifactModel,
+                ArtifactModel.id == SkillVersionModel.artifact_id,
+            )
             .where(
-                SkillVersionModel.name == _required(name, "name"),
-                SkillVersionModel.version == _required(version, "version"),
+                SkillVersionModel.name == clean_name,
+                SkillVersionModel.version == clean_version,
                 SkillVersionModel.status == prior_status.value,
             )
-            .values(**values)
-            .returning(SkillVersionModel)
+        )
+        statement = (
+            insert(SkillTransitionAuditModel)
+            .from_select(
+                [
+                    "id",
+                    "skill_version_id",
+                    "transition_number",
+                    "actor_id",
+                    "prior_status",
+                    "new_status",
+                    "reason",
+                    "correlation_id",
+                    "idempotency_key",
+                    "artifact_digest",
+                    "manifest_digest",
+                ],
+                transition,
+            )
+            .returning(SkillTransitionAuditModel.skill_version_id)
         )
 
         try:
             async with self._database.transaction() as session:
                 result = await session.execute(statement)
-                skill = result.scalar_one_or_none()
-                if skill is None:
+                skill_id = result.scalar_one_or_none()
+                if skill_id is None:
                     await self._raise_transition_failure(
                         session=session,
-                        name=name,
-                        version=version,
+                        name=clean_name,
+                        version=clean_version,
                         target_status=target_status,
                     )
 
-                artifact = await session.get(ArtifactModel, skill.artifact_id)
-                if artifact is None:
+                skill = await session.get(SkillVersionModel, skill_id)
+                if skill is None:
                     raise RecordNotFoundError(
-                        "the skill publication has no durable artifact"
+                        "the transitioned skill publication was not found"
                     )
-                session.add(
-                    SkillTransitionAuditModel(
-                        id=new_record_id(),
-                        skill_version_id=skill.id,
-                        transition_number=skill.revision,
-                        actor_id=actor_id,
-                        prior_status=prior_status.value,
-                        new_status=target_status.value,
-                        reason=_required(reason, "reason"),
-                        correlation_id=_required(correlation_id, "correlation_id"),
-                        idempotency_key=_required(idempotency_key, "idempotency_key"),
-                        artifact_digest=artifact.artifact_digest,
-                        manifest_digest=artifact.manifest_digest,
-                    )
-                )
-                await session.flush()
         except IntegrityError as exc:
             raise _conflict("skill transition", exc) from exc
         return skill

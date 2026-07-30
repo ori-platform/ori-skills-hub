@@ -21,7 +21,6 @@ from sqlalchemy import (
     UniqueConstraint,
     event,
     func,
-    inspect,
 )
 from sqlalchemy.engine import Connection
 from sqlalchemy.orm import DeclarativeBase, Mapped, Mapper, mapped_column
@@ -68,12 +67,126 @@ _SQLITE_SCHEMA_GUARDS = (
     END
     """,
     """
+    CREATE TRIGGER IF NOT EXISTS skill_transition_audit_validate_state
+    BEFORE INSERT ON skill_transition_audit
+    WHEN NEW.prior_status IS NOT NULL
+         AND NOT EXISTS (
+             SELECT 1
+             FROM skill_versions AS skill
+             JOIN artifacts AS artifact ON artifact.id = skill.artifact_id
+             WHERE skill.id = NEW.skill_version_id
+               AND skill.status = NEW.prior_status
+               AND skill.revision + 1 = NEW.transition_number
+               AND artifact.artifact_digest = NEW.artifact_digest
+               AND artifact.manifest_digest = NEW.manifest_digest
+               AND (
+                   (NEW.prior_status = 'pending_review'
+                    AND NEW.new_status IN ('listed', 'rejected'))
+                   OR (NEW.prior_status = 'listed'
+                       AND NEW.new_status = 'unlisted')
+               )
+         )
+    BEGIN
+        SELECT RAISE(ABORT, 'audit does not match current skill state');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS skill_transition_audit_apply_listing
+    AFTER INSERT ON skill_transition_audit
+    WHEN NEW.prior_status = 'pending_review'
+         AND NEW.new_status = 'listed'
+    BEGIN
+        UPDATE skill_versions
+        SET status = NEW.new_status,
+            revision = NEW.transition_number,
+            review_approved_at = NEW.occurred_at,
+            review_approved_by = NEW.actor_id,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = NEW.skill_version_id
+          AND status = NEW.prior_status
+          AND revision + 1 = NEW.transition_number;
+        SELECT CASE
+            WHEN changes() <> 1
+            THEN RAISE(ABORT, 'audit transition did not update skill state')
+        END;
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS skill_transition_audit_apply_nonlisting
+    AFTER INSERT ON skill_transition_audit
+    WHEN NEW.prior_status IS NOT NULL
+         AND NEW.new_status IN ('rejected', 'unlisted')
+    BEGIN
+        UPDATE skill_versions
+        SET status = NEW.new_status,
+            revision = NEW.transition_number,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = NEW.skill_version_id
+          AND status = NEW.prior_status
+          AND revision + 1 = NEW.transition_number;
+        SELECT CASE
+            WHEN changes() <> 1
+            THEN RAISE(ABORT, 'audit transition did not update skill state')
+        END;
+    END
+    """,
+    """
     CREATE TRIGGER IF NOT EXISTS skill_versions_validate_initial_status
     BEFORE INSERT ON skill_versions
     WHEN NEW.status NOT IN ('pending_review', 'listed')
          OR (NEW.declares_tier_cd AND NEW.status = 'listed')
+         OR NEW.revision <> 1
+         OR NEW.downloads <> 0
+         OR NEW.review_approved_at IS NOT NULL
+         OR NEW.review_approved_by IS NOT NULL
+         OR NOT EXISTS (
+             SELECT 1
+             FROM skill_transition_audit AS audit
+             JOIN artifacts AS artifact ON artifact.id = NEW.artifact_id
+             WHERE audit.skill_version_id = NEW.id
+               AND audit.transition_number = 1
+               AND audit.prior_status IS NULL
+               AND audit.new_status = NEW.status
+               AND audit.artifact_digest = artifact.artifact_digest
+               AND audit.manifest_digest = artifact.manifest_digest
+         )
     BEGIN
         SELECT RAISE(ABORT, 'invalid initial skill status');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS skill_versions_reject_identity_authority_update
+    BEFORE UPDATE OF id, name, version, author_id, artifact_id, declares_tier_cd
+    ON skill_versions
+    BEGIN
+        SELECT RAISE(ABORT, 'skill identity and authority are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS skill_versions_reject_approval_update
+    BEFORE UPDATE OF review_approved_at, review_approved_by ON skill_versions
+    WHEN NOT (
+        OLD.status = 'pending_review'
+        AND NEW.status = 'listed'
+        AND OLD.review_approved_at IS NULL
+        AND OLD.review_approved_by IS NULL
+        AND NEW.review_approved_at IS NOT NULL
+        AND NEW.review_approved_by IS NOT NULL
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'skill approval metadata is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS skill_versions_validate_revision_transition
+    BEFORE UPDATE OF revision ON skill_versions
+    WHEN NEW.revision <> OLD.revision
+         AND (
+             NEW.status = OLD.status
+             OR NEW.revision <> OLD.revision + 1
+         )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid skill revision transition');
     END
     """,
     """
@@ -87,6 +200,32 @@ _SQLITE_SCHEMA_GUARDS = (
          )
     BEGIN
         SELECT RAISE(ABORT, 'invalid skill status transition');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS skill_versions_require_transition_audit
+    BEFORE UPDATE OF status ON skill_versions
+    WHEN NEW.status <> OLD.status
+         AND NOT EXISTS (
+             SELECT 1
+             FROM skill_transition_audit AS audit
+             JOIN artifacts AS artifact ON artifact.id = OLD.artifact_id
+             WHERE audit.skill_version_id = OLD.id
+               AND audit.transition_number = NEW.revision
+               AND audit.prior_status = OLD.status
+               AND audit.new_status = NEW.status
+               AND audit.artifact_digest = artifact.artifact_digest
+               AND audit.manifest_digest = artifact.manifest_digest
+               AND (
+                   NEW.status <> 'listed'
+                   OR (
+                       NEW.review_approved_at = audit.occurred_at
+                       AND NEW.review_approved_by = audit.actor_id
+                   )
+               )
+         )
+    BEGIN
+        SELECT RAISE(ABORT, 'skill status transition requires matching audit');
     END
     """,
 )
@@ -239,6 +378,11 @@ class SkillVersionModel(Base):
             name="approval_fields_paired",
         ),
         CheckConstraint(
+            "status NOT IN ('pending_review', 'rejected') "
+            "OR (review_approved_at IS NULL AND review_approved_by IS NULL)",
+            name="approval_fields_match_status",
+        ),
+        CheckConstraint(
             "NOT declares_tier_cd OR status <> 'listed' "
             "OR (review_approved_at IS NOT NULL AND review_approved_by IS NOT NULL)",
             name="tier_cd_listing_reviewed",
@@ -301,7 +445,11 @@ class SkillTransitionAuditModel(Base):
         ),
         CheckConstraint("length(actor_id) > 0", name="actor_set"),
         CheckConstraint("length(reason) > 0", name="reason_set"),
-        CheckConstraint("transition_number >= 1", name="transition_number_positive"),
+        CheckConstraint(
+            "(prior_status IS NULL AND transition_number = 1) "
+            "OR (prior_status IS NOT NULL AND transition_number >= 2)",
+            name="transition_number_matches_state",
+        ),
         CheckConstraint("length(correlation_id) > 0", name="correlation_id_set"),
         CheckConstraint("length(idempotency_key) > 0", name="idempotency_key_set"),
         CheckConstraint(
@@ -321,7 +469,13 @@ class SkillTransitionAuditModel(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_record_id)
     skill_version_id: Mapped[str] = mapped_column(
-        ForeignKey("skill_versions.id", ondelete="RESTRICT"), nullable=False
+        ForeignKey(
+            "skill_versions.id",
+            ondelete="RESTRICT",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        nullable=False,
     )
     transition_number: Mapped[int] = mapped_column(Integer, nullable=False)
     actor_id: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -345,16 +499,12 @@ def _reject_immutable_change(
     )
 
 
-def _validate_skill_update(
-    _mapper: Mapper[Any], _connection: Connection, target: SkillVersionModel
+def _reject_skill_update(
+    _mapper: Mapper[Any], _connection: Connection, _target: SkillVersionModel
 ) -> None:
-    status_history = inspect(target).attrs.status.history
-    if not status_history.has_changes():
-        return
-
     raise InvalidStateTransitionError(
-        "skill status transitions must use HubRepository so the state change "
-        "and audit row commit atomically"
+        "skill changes must use HubRepository so state changes and audit rows "
+        "commit atomically"
     )
 
 
@@ -393,5 +543,5 @@ event.listen(
     _reject_client_audit_timestamp,
 )
 event.listen(SkillVersionModel, "before_insert", _validate_initial_skill)
-event.listen(SkillVersionModel, "before_update", _validate_skill_update)
+event.listen(SkillVersionModel, "before_update", _reject_skill_update)
 event.listen(Base.metadata, "after_create", _install_sqlite_schema_guards)
