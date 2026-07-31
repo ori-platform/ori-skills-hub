@@ -17,7 +17,7 @@ from alembic.config import Config
 from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
-from hub.core.models import SkillStatus
+from hub.core.models import ScannerVerdict, SkillStatus
 from hub.db import (
     Database,
     DatabaseConfigurationError,
@@ -86,6 +86,10 @@ async def _publish(
         byte_size=128,
         artifact_signature="artifact-signature",
         manifest_signature="manifest-signature",
+        scanner_verdict=ScannerVerdict.CLEAN,
+        scanner_detail="scanner clean",
+        author_artifact_digest=f"sha256:{digest_character * 64}",
+        author_artifact_signature="author-artifact-signature",
         declares_tier_cd=declares_tier_cd,
         initial_status=initial_status,
         authenticated_actor_id=author_id,
@@ -159,7 +163,7 @@ def test_alembic_upgrade_is_repeatable(
                 "SELECT name FROM sqlite_master WHERE type = 'trigger'"
             )
         }
-    assert revision == ("1e9630e268d4",)
+    assert revision == ("7a2b9c4d1e05",)
     assert "skill_transition_audit" in tables
     assert triggers == {
         "artifacts_reject_delete",
@@ -318,6 +322,90 @@ def test_publication_writes_artifact_skill_and_initial_audit_atomically(
     _run(scenario())
 
 
+def test_publication_persists_scanner_verdict_and_author_provenance(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        database, repository, author_id = await _setup_repository(tmp_path)
+        try:
+            skill = await _publish(repository, author_id=author_id)
+            async with database.transaction() as session:
+                artifact = await session.get(ArtifactModel, skill.artifact_id)
+
+            assert artifact is not None
+            assert artifact.scanner_verdict == ScannerVerdict.CLEAN.value
+            assert artifact.scanner_detail == "scanner clean"
+            assert artifact.author_artifact_digest == _ARTIFACT_DIGEST
+            assert artifact.author_artifact_signature == "author-artifact-signature"
+        finally:
+            await database.dispose()
+
+    _run(scenario())
+
+
+def test_publication_rejects_oversized_scanner_detail(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database, repository, author_id = await _setup_repository(tmp_path)
+        try:
+            with pytest.raises(ValueError, match="scanner_detail"):
+                await repository.create_publication(
+                    name="energy",
+                    version="1.0.0",
+                    artifact_digest=_ARTIFACT_DIGEST,
+                    manifest_digest=_MANIFEST_DIGEST,
+                    storage_key="energy/1.0.0/a.tar.gz",
+                    byte_size=128,
+                    artifact_signature="artifact-signature",
+                    manifest_signature="manifest-signature",
+                    scanner_verdict=ScannerVerdict.UNAVAILABLE,
+                    scanner_detail="x" * 1025,
+                    author_artifact_digest=_ARTIFACT_DIGEST,
+                    author_artifact_signature="author-artifact-signature",
+                    declares_tier_cd=False,
+                    initial_status=SkillStatus.LISTED,
+                    authenticated_actor_id=author_id,
+                    reason="validated publication",
+                    correlation_id="publish:energy:1.0.0",
+                    idempotency_key="publish-energy-1.0.0",
+                )
+        finally:
+            await database.dispose()
+
+    _run(scenario())
+
+
+def test_early_replay_and_identity_lookups(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database, repository, author_id = await _setup_repository(tmp_path)
+        try:
+            assert not await repository.publication_recorded_for_idempotency_key(
+                actor_id=author_id,
+                idempotency_key="publish-energy-1.0.0",
+            )
+            assert not await repository.skill_version_exists(
+                name="energy", version="1.0.0"
+            )
+
+            await _publish(repository, author_id=author_id)
+
+            assert await repository.publication_recorded_for_idempotency_key(
+                actor_id=author_id,
+                idempotency_key="publish-energy-1.0.0",
+            )
+            assert await repository.skill_version_exists(name="energy", version="1.0.0")
+            assert not await repository.publication_recorded_for_idempotency_key(
+                actor_id=author_id,
+                idempotency_key="publish-energy-2.0.0",
+            )
+            assert not await repository.skill_version_exists(
+                name="energy", version="2.0.0"
+            )
+        finally:
+            await database.dispose()
+
+    _run(scenario())
+
+
 def test_initial_publication_requires_matching_initial_audit(tmp_path: Path) -> None:
     async def scenario() -> None:
         database, _repository, author_id = await _setup_repository(tmp_path)
@@ -334,6 +422,10 @@ def test_initial_publication_requires_matching_initial_audit(tmp_path: Path) -> 
                             byte_size=128,
                             artifact_signature="artifact-signature",
                             manifest_signature="manifest-signature",
+                            scanner_verdict=ScannerVerdict.CLEAN.value,
+                            scanner_detail="scanner clean",
+                            author_artifact_digest=_ARTIFACT_DIGEST,
+                            author_artifact_signature="author-artifact-signature",
                         )
                     )
                     await session.execute(
@@ -516,6 +608,10 @@ def test_tier_cd_cannot_be_listed_without_review(tmp_path: Path) -> None:
                             byte_size=128,
                             artifact_signature="forged-artifact-signature",
                             manifest_signature="forged-manifest-signature",
+                            scanner_verdict=ScannerVerdict.CLEAN.value,
+                            scanner_detail="scanner clean",
+                            author_artifact_digest=f"sha256:{'d' * 64}",
+                            author_artifact_signature="forged-author-signature",
                         )
                     )
                     await session.execute(

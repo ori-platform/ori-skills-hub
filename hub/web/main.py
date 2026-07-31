@@ -11,10 +11,19 @@ from typing import Any
 
 from hub import __version__
 from hub.core.config import load_from_env
+from hub.core.publish import Scanner
+from hub.db.repository import HubRepository
 from hub.db.session import Database
+from hub.integrations.scan import VirusTotalScanner
 from hub.security.author_identity import AuthorIdentityService
-from hub.security.hub_keys import HubPublicTrustAnchors
+from hub.security.hub_keys import (
+    HubPublicTrustAnchors,
+    HubSigningKeys,
+    load_hub_signing_keys_from_env,
+)
+from hub.storage.objects import ContentAddressedStorage
 from hub.web.authors import create_author_router
+from hub.web.skills import create_skill_router
 
 
 def health_payload(
@@ -33,6 +42,10 @@ def create_app(
     admin_api_key: str | None = None,
     admin_actor_id: str = "bootstrap-admin",
     author_registration_enabled: bool = False,
+    skill_repository: HubRepository | None = None,
+    artifact_storage: ContentAddressedStorage | None = None,
+    hub_signing_keys: HubSigningKeys | None = None,
+    scanner: Scanner | None = None,
     lifespan: Any | None = None,
 ) -> Any:
     try:
@@ -53,6 +66,40 @@ def create_app(
             )
         )
 
+    publish_components = (
+        skill_repository,
+        artifact_storage,
+        hub_signing_keys,
+        scanner,
+    )
+    if any(component is not None for component in publish_components) and (
+        skill_repository is None
+        or artifact_storage is None
+        or hub_signing_keys is None
+        or scanner is None
+    ):
+        raise ValueError(
+            "publish routes require repository, storage, signing keys, "
+            "and scanner together"
+        )
+    if (
+        skill_repository is not None
+        and artifact_storage is not None
+        and hub_signing_keys is not None
+        and scanner is not None
+    ):
+        if author_identity_service is None:
+            raise ValueError("publish routes require the author identity service")
+        app.include_router(
+            create_skill_router(
+                author_identity_service,
+                repository=skill_repository,
+                storage=artifact_storage,
+                signing_keys=hub_signing_keys,
+                scanner=scanner,
+            )
+        )
+
     @app.get("/health")
     async def health() -> dict[str, object]:
         return health_payload(trust_anchors=trust_anchors)
@@ -69,6 +116,8 @@ def create_configured_app() -> Any:
         database,
         token_ttl_seconds=config.author_token_ttl_seconds,
     )
+    signing_keys = load_hub_signing_keys_from_env(publish_capable=False)
+    publish_enabled = signing_keys is not None
 
     @asynccontextmanager
     async def lifespan(_app: Any) -> AsyncIterator[None]:
@@ -78,10 +127,23 @@ def create_configured_app() -> Any:
             await database.dispose()
 
     configured_app = create_app(
+        trust_anchors=(
+            signing_keys.public_trust_anchors if signing_keys is not None else None
+        ),
         author_identity_service=identity_service,
         admin_api_key=config.admin_api_key,
         admin_actor_id=config.admin_actor_id,
         author_registration_enabled=config.author_registration_enabled,
+        skill_repository=HubRepository(database) if publish_enabled else None,
+        artifact_storage=(
+            ContentAddressedStorage(config.storage_local_dir)
+            if publish_enabled
+            else None
+        ),
+        hub_signing_keys=signing_keys,
+        scanner=(
+            VirusTotalScanner(config.virustotal_api_key) if publish_enabled else None
+        ),
         lifespan=lifespan,
     )
     configured_app.state.hub_database = database

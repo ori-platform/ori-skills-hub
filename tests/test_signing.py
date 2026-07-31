@@ -22,6 +22,7 @@ from hub.security.signing import (
     canonical_manifest_bytes,
     decode_public_key,
     decode_signature,
+    parse_detached_metadata_json,
     verify_artifact_signature,
     verify_manifest_signature,
 )
@@ -216,3 +217,44 @@ def test_manifest_canonicalization_is_lexically_stable() -> None:
     reordered["signature"] = "ed25519:ignored-by-canonicalization"
 
     assert canonical_manifest_bytes(reordered) == canonical_manifest_bytes(PARSED_SKILL)
+
+
+def test_parse_detached_metadata_json_accepts_the_vector_document() -> None:
+    raw = json.dumps(ARTIFACT_METADATA)
+    assert parse_detached_metadata_json(raw) == ARTIFACT_METADATA
+
+
+def test_parse_detached_metadata_json_rejects_duplicate_fields() -> None:
+    raw = (
+        '{"artifact_sha256": "sha256:'
+        + "0" * 64
+        + '", "artifact_sha256": "sha256:'
+        + "1" * 64
+        + '", "schema": "ori.skill_artifact_signature.v1", "signature": "ed25519:AA=="}'
+    )
+    with pytest.raises(SignatureVerificationError, match="duplicate fields"):
+        parse_detached_metadata_json(raw)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "not json",
+        "[1, 2, 3]",
+        '"just a string"',
+        "null",
+        json.dumps({**ARTIFACT_METADATA, "signer": "untrusted-label"}),
+        json.dumps({"artifact_sha256": ARTIFACT_METADATA["artifact_sha256"]}),
+        json.dumps({**ARTIFACT_METADATA, "signature": 123}),
+    ],
+)
+def test_parse_detached_metadata_json_rejects_non_contract_documents(raw: str) -> None:
+    with pytest.raises(SignatureVerificationError):
+        parse_detached_metadata_json(raw)
+
+
+def test_parse_detached_metadata_json_enforces_the_size_limit() -> None:
+    oversized = json.dumps({**ARTIFACT_METADATA, "schema": "x" * 4096})
+    with pytest.raises(SignatureVerificationError, match="size limit"):
+        parse_detached_metadata_json(oversized)

@@ -22,6 +22,10 @@ class StorageSafetyError(HubError):
     """Raised when storage paths would escape the configured root."""
 
 
+class StorageIntegrityError(StorageSafetyError):
+    """Raised when stored object bytes do not match their content address."""
+
+
 class TarballError(HubError):
     """Base class for malformed, unsafe, or over-limit skill archives."""
 
@@ -40,3 +44,19 @@ class TarballLimitError(TarballError):
 
 class ConfigError(HubError):
     """Raised when hub configuration is invalid."""
+
+
+class PublishError(HubError):
+    """Base class for publish pipeline failures."""
+
+
+class PublishReplayError(PublishError):
+    """Raised when an idempotency key has already been consumed."""
+
+
+class PublishConflictError(PublishError):
+    """Raised when a publication conflicts with an existing durable record."""
+
+
+class PublishAuthorMismatchError(PublishError):
+    """Raised when the manifest author is not the authenticated author."""

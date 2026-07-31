@@ -11,7 +11,7 @@ from sqlalchemy import insert, literal, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from hub.core.models import SkillStatus
+from hub.core.models import ScannerVerdict, SkillStatus
 from hub.db._models import (
     ArtifactModel,
     SkillTransitionAuditModel,
@@ -80,6 +80,10 @@ class HubRepository:
         byte_size: int,
         artifact_signature: str,
         manifest_signature: str,
+        scanner_verdict: ScannerVerdict,
+        scanner_detail: str,
+        author_artifact_digest: str,
+        author_artifact_signature: str,
         declares_tier_cd: bool,
         initial_status: SkillStatus,
         authenticated_actor_id: str,
@@ -100,6 +104,8 @@ class HubRepository:
             )
         if byte_size < 0:
             raise ValueError("byte_size must not be negative")
+        if len(scanner_detail) > 1024:
+            raise ValueError("scanner_detail must not exceed 1024 characters")
 
         actor_id = _required(authenticated_actor_id, "authenticated_actor_id")
         clean_artifact_digest = _digest(artifact_digest, "artifact_digest")
@@ -112,6 +118,14 @@ class HubRepository:
             byte_size=byte_size,
             artifact_signature=_required(artifact_signature, "artifact_signature"),
             manifest_signature=_required(manifest_signature, "manifest_signature"),
+            scanner_verdict=scanner_verdict.value,
+            scanner_detail=scanner_detail,
+            author_artifact_digest=_digest(
+                author_artifact_digest, "author_artifact_digest"
+            ),
+            author_artifact_signature=_required(
+                author_artifact_signature, "author_artifact_signature"
+            ),
         )
         skill = SkillVersionModel(
             id=new_record_id(),
@@ -266,6 +280,40 @@ class HubRepository:
             return await self._get_skill_in_session(
                 session=session, name=name, version=version
             )
+
+    async def publication_recorded_for_idempotency_key(
+        self, *, actor_id: str, idempotency_key: str
+    ) -> bool:
+        """Return whether the actor already consumed this idempotency key."""
+
+        actor = _required(actor_id, "actor_id")
+        key = _required(idempotency_key, "idempotency_key")
+        async with self._database.transaction() as session:
+            result = await session.scalars(
+                select(SkillTransitionAuditModel.id)
+                .where(
+                    SkillTransitionAuditModel.actor_id == actor,
+                    SkillTransitionAuditModel.idempotency_key == key,
+                )
+                .limit(1)
+            )
+            return result.first() is not None
+
+    async def skill_version_exists(self, *, name: str, version: str) -> bool:
+        """Return whether any publication already holds this skill identity."""
+
+        clean_name = _required(name, "name")
+        clean_version = _required(version, "version")
+        async with self._database.transaction() as session:
+            result = await session.scalars(
+                select(SkillVersionModel.id)
+                .where(
+                    SkillVersionModel.name == clean_name,
+                    SkillVersionModel.version == clean_version,
+                )
+                .limit(1)
+            )
+            return result.first() is not None
 
     async def get_transition_history(
         self, *, name: str, version: str

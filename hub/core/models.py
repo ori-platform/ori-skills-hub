@@ -16,6 +16,14 @@ class SkillStatus(StrEnum):
     UNLISTED = "unlisted"
 
 
+class ScannerVerdict(StrEnum):
+    """Three-state malware scan outcome persisted for every publication."""
+
+    CLEAN = "clean"
+    SUSPICIOUS = "suspicious"
+    UNAVAILABLE = "unavailable"
+
+
 @dataclass(frozen=True)
 class SkillRecord:
     name: str
@@ -33,3 +41,14 @@ class PublishDecision:
     status: SkillStatus
     declares_tier_cd: bool
     reason: str
+
+
+@dataclass(frozen=True)
+class PublishResult:
+    """Public summary of one completed publish pipeline run."""
+
+    name: str
+    version: str
+    status: SkillStatus
+    artifact_digest: str
+    manifest_digest: str
