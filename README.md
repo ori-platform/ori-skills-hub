@@ -226,6 +226,37 @@ trigger or declared action carrying Tier C/D authority requires manual review.
 Descriptive top-level extensions remain intact and validation never opens or
 executes package hook code.
 
+## Malware Scanning
+
+VirusTotal scanning is optional for local development. Setting
+`HUB_VIRUSTOTAL_API_KEY` enables submission of the author-supplied skill archive
+to the fixed VirusTotal v3 [file upload endpoint](https://docs.virustotal.com/reference/files-scan),
+followed by bounded polling of the returned
+[analysis](https://docs.virustotal.com/reference/analysis). VirusTotal's
+standard file API may share submitted samples with its security community, so
+deployments must account for that external data handling before enabling the
+integration. Production operators must also use an API entitlement that permits
+their commercial workflow and comply with the applicable
+[VirusTotal API terms](https://docs.virustotal.com/reference/getting-started);
+a community/public API key is not sufficient authorization for commercial Hub
+operation.
+
+The scanner has an eight-second per-request timeout, a 25-second total scan
+budget, and exponential polling backoff capped at four seconds. A result is
+`clean` only when VirusTotal reports a completed analysis, zero malicious and
+suspicious detections, and a strict majority of affirmative `harmless` results
+over all `undetected`, failed, timed-out, confirmed-timeout, and unsupported
+engine outcomes. An all-`undetected` result, a tie, or an inconclusive majority
+requires manual review. Malicious detections return `malicious`; suspicious,
+inconclusive, malformed, timed-out, rate-limited, authentication-failed, and
+other unavailable outcomes return `pending_manual_review`.
+
+Without an API key the scanner records `skipped`. Under the Hub listing policy,
+both `skipped` and `pending_manual_review` keep an upload pending for a human
+decision; scanner unavailability never produces an automatic listing. API keys
+are sent only in the VirusTotal `x-apikey` request header and are not included in
+scanner results or logs.
+
 ## Security Gate
 
 Any skill declaring Tier C or Tier D action authority must enter
