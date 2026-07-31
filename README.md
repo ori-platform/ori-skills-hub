@@ -244,10 +244,12 @@ operation.
 The scanner has an eight-second per-request timeout, a 25-second total scan
 budget, and exponential polling backoff capped at four seconds. A result is
 `clean` only when VirusTotal reports a completed analysis, zero malicious and
-suspicious detections, and at least one completed engine result. Malicious
-detections return `malicious`; suspicious, inconclusive, malformed, timed-out,
-rate-limited, authentication-failed, and other unavailable outcomes return
-`pending_manual_review`.
+suspicious detections, and a strict majority of affirmative `harmless` results
+over all `undetected`, failed, timed-out, confirmed-timeout, and unsupported
+engine outcomes. An all-`undetected` result, a tie, or an inconclusive majority
+requires manual review. Malicious detections return `malicious`; suspicious,
+inconclusive, malformed, timed-out, rate-limited, authentication-failed, and
+other unavailable outcomes return `pending_manual_review`.
 
 Without an API key the scanner records `skipped`. Under the Hub listing policy,
 both `skipped` and `pending_manual_review` keep an upload pending for a human

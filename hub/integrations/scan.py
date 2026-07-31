@@ -23,6 +23,14 @@ _DEFAULT_MAX_WAIT_SECONDS: Final = 25.0
 _DEFAULT_INITIAL_BACKOFF_SECONDS: Final = 0.5
 _DEFAULT_MAX_BACKOFF_SECONDS: Final = 4.0
 
+_INCONCLUSIVE_STAT_NAMES: Final = (
+    "undetected",
+    "failure",
+    "timeout",
+    "confirmed-timeout",
+    "type-unsupported",
+)
+
 
 class _InvalidVirusTotalResponse(ValueError):
     """Raised internally when VirusTotal does not return the v3 contract."""
@@ -223,7 +231,9 @@ def _completed_verdict(stats: dict[str, object] | None) -> ScanResult:
     malicious = _non_negative_count(stats, "malicious")
     suspicious = _non_negative_count(stats, "suspicious")
     harmless = _non_negative_count(stats, "harmless")
-    undetected = _non_negative_count(stats, "undetected")
+    inconclusive = sum(
+        _non_negative_count(stats, name) for name in _INCONCLUSIVE_STAT_NAMES
+    )
 
     if malicious:
         return ScanResult(
@@ -238,14 +248,18 @@ def _completed_verdict(stats: dict[str, object] | None) -> ScanResult:
             f"VirusTotal returned suspicious detections (suspicious={suspicious})"
         )
 
-    completed_engines = harmless + undetected
-    if completed_engines == 0:
-        return _pending("VirusTotal analysis returned no conclusive engine results")
+    if harmless == 0:
+        return _pending("VirusTotal analysis returned no affirmative harmless results")
+    if harmless <= inconclusive:
+        return _pending(
+            "VirusTotal analysis returned insufficient affirmative harmless results "
+            f"(harmless={harmless}, inconclusive={inconclusive})"
+        )
     return ScanResult(
         status="clean",
         detail=(
-            "VirusTotal completed with no malicious or suspicious detections "
-            f"(engines={completed_engines})"
+            "VirusTotal completed with an affirmative harmless majority "
+            f"(harmless={harmless}, inconclusive={inconclusive})"
         ),
     )
 

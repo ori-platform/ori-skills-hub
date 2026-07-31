@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import httpx
 import pytest
@@ -49,9 +49,30 @@ def _analysis_response(
     analysis_id: str = _ANALYSIS_ID,
     malicious: object = 0,
     suspicious: object = 0,
-    harmless: object = 8,
-    undetected: object = 52,
+    harmless: object = 52,
+    undetected: object = 8,
+    failure: object = 0,
+    timeout: object = 0,
+    confirmed_timeout: object = 0,
+    type_unsupported: object = 0,
+    stats_overrides: Mapping[str, object] | None = None,
+    omitted_stats: frozenset[str] = frozenset(),
 ) -> httpx.Response:
+    stats: dict[str, object] = {
+        "malicious": malicious,
+        "suspicious": suspicious,
+        "harmless": harmless,
+        "undetected": undetected,
+        "failure": failure,
+        "timeout": timeout,
+        "confirmed-timeout": confirmed_timeout,
+        "type-unsupported": type_unsupported,
+    }
+    if stats_overrides is not None:
+        stats.update(stats_overrides)
+    for name in omitted_stats:
+        stats.pop(name)
+
     return httpx.Response(
         200,
         request=request,
@@ -61,12 +82,7 @@ def _analysis_response(
                 "id": analysis_id,
                 "attributes": {
                     "status": status,
-                    "stats": {
-                        "malicious": malicious,
-                        "suspicious": suspicious,
-                        "harmless": harmless,
-                        "undetected": undetected,
-                    },
+                    "stats": stats,
                 },
             }
         },
@@ -89,7 +105,8 @@ def test_scan_clean() -> None:
     result = _scanner(handler).scan(b"archive-bytes")
 
     assert result.status == "clean"
-    assert "engines=60" in result.detail
+    assert "harmless=52" in result.detail
+    assert "inconclusive=8" in result.detail
     assert [request.method for request in requests] == ["POST", "GET"]
 
 
@@ -172,7 +189,151 @@ def test_completed_result_without_conclusive_engines_requires_manual_review() ->
     result = _scanner(handler).scan(b"archive-bytes")
 
     assert result.status == "pending_manual_review"
-    assert "no conclusive engine results" in result.detail
+    assert "no affirmative harmless results" in result.detail
+
+
+def test_all_undetected_result_requires_manual_review() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return _upload_response(request)
+        return _analysis_response(request, harmless=0, undetected=60)
+
+    result = _scanner(handler).scan(b"archive-bytes")
+
+    assert result.status == "pending_manual_review"
+    assert "no affirmative harmless results" in result.detail
+
+
+def test_failure_dominated_result_without_harmless_verdict_requires_review() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return _upload_response(request)
+        return _analysis_response(
+            request,
+            harmless=0,
+            undetected=1,
+            failure=59,
+        )
+
+    result = _scanner(handler).scan(b"archive-bytes")
+
+    assert result.status == "pending_manual_review"
+    assert "no affirmative harmless results" in result.detail
+
+
+def test_undetected_majority_requires_manual_review() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return _upload_response(request)
+        return _analysis_response(request, harmless=1, undetected=59)
+
+    result = _scanner(handler).scan(b"archive-bytes")
+
+    assert result.status == "pending_manual_review"
+    assert "insufficient affirmative harmless results" in result.detail
+
+
+@pytest.mark.parametrize(
+    ("harmless", "failure", "expected_status"),
+    [
+        pytest.param(31, 29, "clean", id="affirmative-majority"),
+        pytest.param(30, 30, "pending_manual_review", id="tie"),
+        pytest.param(1, 59, "pending_manual_review", id="failure-dominated"),
+    ],
+)
+def test_mixed_harmless_and_failure_results_apply_confidence_policy(
+    harmless: int,
+    failure: int,
+    expected_status: str,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return _upload_response(request)
+        return _analysis_response(
+            request,
+            harmless=harmless,
+            undetected=0,
+            failure=failure,
+        )
+
+    result = _scanner(handler).scan(b"archive-bytes")
+
+    assert result.status == expected_status
+
+
+@pytest.mark.parametrize(
+    "inconclusive_count",
+    [
+        pytest.param({"timeout": 59}, id="timeout"),
+        pytest.param({"confirmed-timeout": 59}, id="confirmed-timeout"),
+        pytest.param({"type-unsupported": 59}, id="type-unsupported"),
+    ],
+)
+def test_inconclusive_engine_outcomes_require_manual_review(
+    inconclusive_count: dict[str, int],
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return _upload_response(request)
+        return _analysis_response(
+            request,
+            harmless=1,
+            undetected=0,
+            stats_overrides=inconclusive_count,
+        )
+
+    result = _scanner(handler).scan(b"archive-bytes")
+
+    assert result.status == "pending_manual_review"
+    assert "insufficient affirmative harmless results" in result.detail
+
+
+@pytest.mark.parametrize(
+    "invalid_stat",
+    [
+        pytest.param({"failure": True}, id="failure"),
+        pytest.param({"timeout": -1}, id="timeout"),
+        pytest.param({"confirmed-timeout": "0"}, id="confirmed-timeout"),
+        pytest.param({"type-unsupported": 1.5}, id="type-unsupported"),
+    ],
+)
+def test_invalid_inconclusive_counts_require_manual_review(
+    invalid_stat: dict[str, object],
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return _upload_response(request)
+        return _analysis_response(request, stats_overrides=invalid_stat)
+
+    result = _scanner(handler).scan(b"archive-bytes")
+
+    assert result.status == "pending_manual_review"
+    assert "invalid response" in result.detail
+
+
+@pytest.mark.parametrize(
+    "missing_stat",
+    [
+        "malicious",
+        "suspicious",
+        "harmless",
+        "undetected",
+        "failure",
+        "timeout",
+        "confirmed-timeout",
+        "type-unsupported",
+    ],
+)
+def test_missing_documented_count_requires_manual_review(missing_stat: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return _upload_response(request)
+        return _analysis_response(request, omitted_stats=frozenset({missing_stat}))
+
+    result = _scanner(handler).scan(b"archive-bytes")
+
+    assert result.status == "pending_manual_review"
+    assert "invalid response" in result.detail
 
 
 @pytest.mark.parametrize(
