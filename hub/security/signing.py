@@ -25,6 +25,7 @@ SIGNATURE_PREFIX: Final = "ed25519:"
 ARTIFACT_DIGEST_PREFIX: Final = "sha256:"
 ARTIFACT_SIGNATURE_SCHEMA: Final = "ori.skill_artifact_signature.v1"
 BUNDLED_SENTINEL: Final = "bundled"
+MAX_DETACHED_METADATA_BYTES: Final = 4096
 SIGNING_VECTOR_SHA256: Final = (
     "13832babac98468ddd368aafd04c5140bba771f568500c50d4bac60c8588fddc"
 )
@@ -233,6 +234,44 @@ def _parse_artifact_metadata(
             "artifact_sha256 must use sha256: followed by 64 lowercase hex digits"
         )
     return parsed
+
+
+def _reject_duplicate_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    mapping: dict[str, object] = {}
+    for key, value in pairs:
+        if key in mapping:
+            raise SignatureVerificationError(
+                "artifact signature metadata contains duplicate fields"
+            )
+        mapping[key] = value
+    return mapping
+
+
+def parse_detached_metadata_json(raw: str) -> ArtifactSignatureMetadata:
+    """Parse bounded strict JSON into validated detached artifact metadata.
+
+    The input is a raw JSON document such as an HTTP header value. Duplicate
+    object fields are rejected during parsing, before the exact three-field
+    v1 schema is enforced by ``_parse_artifact_metadata``.
+    """
+
+    if not isinstance(raw, str):
+        raise SignatureVerificationError("artifact signature metadata must be text")
+    if len(raw.encode("utf-8")) > MAX_DETACHED_METADATA_BYTES:
+        raise SignatureVerificationError(
+            "artifact signature metadata exceeds the size limit"
+        )
+    try:
+        parsed = json.loads(raw, object_pairs_hook=_reject_duplicate_fields)
+    except json.JSONDecodeError as exc:
+        raise SignatureVerificationError(
+            "artifact signature metadata is not valid JSON"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise SignatureVerificationError(
+            "artifact signature metadata must be a JSON object"
+        )
+    return _parse_artifact_metadata(parsed)
 
 
 def verify_artifact_signature(

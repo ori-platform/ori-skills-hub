@@ -1211,6 +1211,22 @@ class ArtifactModel(Base):
         CheckConstraint(
             "length(manifest_signature) > 0", name="manifest_signature_set"
         ),
+        CheckConstraint(
+            "scanner_verdict IN ('clean', 'suspicious', 'unavailable')",
+            name="scanner_verdict_valid",
+        ),
+        CheckConstraint(
+            "length(scanner_detail) <= 1024", name="scanner_detail_bounded"
+        ),
+        CheckConstraint(
+            "author_artifact_digest LIKE 'sha256:%' "
+            "AND length(author_artifact_digest) = 71",
+            name="author_artifact_digest_valid",
+        ),
+        CheckConstraint(
+            "length(author_artifact_signature) > 0",
+            name="author_artifact_signature_set",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_record_id)
@@ -1222,6 +1238,12 @@ class ArtifactModel(Base):
     byte_size: Mapped[int] = mapped_column(Integer, nullable=False)
     artifact_signature: Mapped[str] = mapped_column(String(512), nullable=False)
     manifest_signature: Mapped[str] = mapped_column(String(512), nullable=False)
+    scanner_verdict: Mapped[str] = mapped_column(String(32), nullable=False)
+    scanner_detail: Mapped[str] = mapped_column(
+        String(1024), nullable=False, default="", server_default=""
+    )
+    author_artifact_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    author_artifact_signature: Mapped[str] = mapped_column(String(512), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
     )

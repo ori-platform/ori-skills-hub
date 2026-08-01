@@ -147,6 +147,29 @@ An operator must migrate or remove them explicitly before retrying the schema
 upgrade. Downgrade also fails closed after an authenticated identity has been
 registered, preventing silent deletion of key and audit history.
 
+## Publish API
+
+Authenticated authors publish a signed skill archive with `POST /api/skills`.
+The request body is the raw gzip-compressed tarball. It requires these headers:
+
+- `Authorization: Bearer <author credential>`
+- `X-Author-Artifact-Metadata`: strict JSON detached metadata for the author's
+  signature over the exact upload bytes
+- `Idempotency-Key`: a single-use publication request key
+- `X-Correlation-ID`: an operator-visible request correlation identifier
+
+The Hub verifies the author signature before archive inspection or durable
+storage. A successful request returns `201 Created` with `name`, `version`,
+`status`, `artifact_digest`, and `manifest_digest`; it never returns signature
+material. Replayed idempotency keys and existing skill versions return `409`.
+Malformed, invalid, or tampered archives and metadata return `422`; archives
+over the ingress limit return `413`.
+
+Tier C/D skills always enter `pending_review`. A suspicious or unavailable
+scanner result also remains `pending_review`, even for lower-tier skills. Hub
+admission is distribution evidence, not runtime authority: `ori-runtime`
+independently verifies the signed package before execution.
+
 ## Hub Signing Keys
 
 The Hub uses distinct APIs for the two signing profiles in
