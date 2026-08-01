@@ -170,6 +170,26 @@ scanner result also remains `pending_review`, even for lower-tier skills. Hub
 admission is distribution evidence, not runtime authority: `ori-runtime`
 independently verifies the signed package before execution.
 
+## Public Skill API
+
+Public endpoints expose only listed skill versions. Pending-review, rejected,
+and unlisted records return `404` and are never included in public results.
+
+- `GET /api/skills` returns up to 100 public version summaries; use `limit`
+  (1-100) to bound the result set.
+- `GET /api/skills/{name}` returns every listed version for that name.
+- `GET /api/skills/{name}/download?version={version}` returns the exact signed
+  gzip tarball for one listed version. `version` is required; the Hub never
+  selects an implicit latest version.
+
+Downloads use `application/gzip` with a safe attachment filename. The Hub
+returns `X-Hub-Artifact-Metadata`, a bounded strict JSON document containing
+the v1 schema, artifact digest, and Hub detached signature for the exact
+response bytes. Consumers must verify this metadata against the Hub artifact
+trust anchor before extracting the archive. The Hub verifies the stored
+content-addressed object before incrementing its download counter; unavailable
+or corrupted artifacts return `503` without incrementing the counter.
+
 ## Hub Signing Keys
 
 The Hub uses distinct APIs for the two signing profiles in

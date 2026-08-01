@@ -5,9 +5,12 @@
 
 from __future__ import annotations
 
+import json
 from typing import Annotated, NoReturn
+from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi.responses import StreamingResponse
 
 from hub.core.errors import (
     PublishAuthorMismatchError,
@@ -15,21 +18,32 @@ from hub.core.errors import (
     PublishReplayError,
     SignatureVerificationError,
     SkillValidationError,
+    StorageIntegrityError,
     TarballError,
 )
 from hub.core.models import PublishResult
 from hub.core.publish import Scanner, publish_skill
-from hub.db.errors import PersistenceConflictError
-from hub.db.repository import HubRepository
+from hub.db.errors import (
+    InvalidStateTransitionError,
+    PersistenceConflictError,
+    RecordNotFoundError,
+)
+from hub.db.repository import HubRepository, PublicSkillVersion
 from hub.security.author_identity import AuthenticatedAuthor, AuthorIdentityService
 from hub.security.hub_keys import HubSigningKeys
-from hub.security.signing import parse_detached_metadata_json
+from hub.security.signing import (
+    ARTIFACT_SIGNATURE_SCHEMA,
+    MAX_DETACHED_METADATA_BYTES,
+    parse_detached_metadata_json,
+)
 from hub.storage.objects import ContentAddressedStorage
 from hub.storage.tarball import DEFAULT_TARBALL_LIMITS, TarballLimits
 from hub.web.authors import author_authentication_dependency
 
 _PUBLISH_REASON = "skill publication"
 _MAX_REQUEST_HEADER_CHARS = 255
+_PUBLIC_LIST_LIMIT = 100
+_HUB_ARTIFACT_METADATA_HEADER = "X-Hub-Artifact-Metadata"
 
 
 def _required_request_header(value: str | None, *, name: str) -> str:
@@ -106,6 +120,39 @@ def _publish_payload(result: PublishResult) -> dict[str, object]:
     }
 
 
+def _public_skill_payload(skill: PublicSkillVersion) -> dict[str, object]:
+    return {
+        "name": skill.name,
+        "version": skill.version,
+        "author": skill.author,
+        "downloads": skill.downloads,
+        "published_at": skill.created_at.isoformat(),
+        "byte_size": skill.byte_size,
+    }
+
+
+def _not_found() -> NoReturn:
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="skill was not found",
+    )
+
+
+def _hub_artifact_metadata_header(skill: PublicSkillVersion) -> str:
+    metadata = json.dumps(
+        {
+            "artifact_sha256": skill.artifact_digest,
+            "schema": ARTIFACT_SIGNATURE_SCHEMA,
+            "signature": skill.artifact_signature,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    if len(metadata.encode("utf-8")) > MAX_DETACHED_METADATA_BYTES:
+        raise RuntimeError("Hub artifact metadata exceeds its response header limit")
+    return metadata
+
+
 def create_skill_router(
     author_identity_service: AuthorIdentityService,
     *,
@@ -119,6 +166,52 @@ def create_skill_router(
 
     router = APIRouter(prefix="/api/skills", tags=["skills"])
     require_author = author_authentication_dependency(author_identity_service)
+
+    @router.get("")
+    async def list_skills(
+        limit: Annotated[int, Query(ge=1, le=_PUBLIC_LIST_LIMIT)] = 50,
+    ) -> dict[str, object]:
+        skills = await repository.list_listed_skills(limit=limit)
+        return {"skills": [_public_skill_payload(skill) for skill in skills]}
+
+    @router.get("/{name}")
+    async def skill_detail(name: str) -> dict[str, object]:
+        versions = await repository.list_listed_versions(name=name)
+        if not versions:
+            _not_found()
+        return {
+            "name": versions[0].name,
+            "versions": [_public_skill_payload(skill) for skill in versions],
+        }
+
+    @router.get("/{name}/download")
+    async def download_skill(
+        name: str,
+        version: str | None = Query(default=None),
+    ) -> StreamingResponse:
+        if version is None or not version.strip():
+            _not_found()
+        try:
+            skill = await repository.get_listed_skill(name=name, version=version)
+            artifact_bytes = storage.read(skill.artifact_digest)
+            await repository.increment_downloads(name=skill.name, version=skill.version)
+        except (RecordNotFoundError, InvalidStateTransitionError):
+            _not_found()
+        except (FileNotFoundError, StorageIntegrityError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="skill artifact is temporarily unavailable",
+            ) from exc
+
+        filename = quote(f"{skill.name}-{skill.version}.tar.gz", safe="")
+        return StreamingResponse(
+            iter((artifact_bytes,)),
+            media_type="application/gzip",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{filename}",
+                _HUB_ARTIFACT_METADATA_HEADER: _hub_artifact_metadata_header(skill),
+            },
+        )
 
     @router.post("", status_code=status.HTTP_201_CREATED)
     async def publish(
