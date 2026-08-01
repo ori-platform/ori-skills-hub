@@ -183,9 +183,12 @@ and unlisted records return `404` and are never included in public results.
   selects an implicit latest version.
 
 Downloads use `application/gzip` with a safe attachment filename. The Hub
-verifies the stored content-addressed object before incrementing its download
-counter; unavailable or corrupted artifacts return `503` without incrementing
-the counter.
+returns `X-Hub-Artifact-Metadata`, a bounded strict JSON document containing
+the v1 schema, artifact digest, and Hub detached signature for the exact
+response bytes. Consumers must verify this metadata against the Hub artifact
+trust anchor before extracting the archive. The Hub verifies the stored
+content-addressed object before incrementing its download counter; unavailable
+or corrupted artifacts return `503` without incrementing the counter.
 
 ## Hub Signing Keys
 

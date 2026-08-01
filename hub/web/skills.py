@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Annotated, NoReturn
 from urllib.parse import quote
 
@@ -30,7 +31,11 @@ from hub.db.errors import (
 from hub.db.repository import HubRepository, PublicSkillVersion
 from hub.security.author_identity import AuthenticatedAuthor, AuthorIdentityService
 from hub.security.hub_keys import HubSigningKeys
-from hub.security.signing import parse_detached_metadata_json
+from hub.security.signing import (
+    ARTIFACT_SIGNATURE_SCHEMA,
+    MAX_DETACHED_METADATA_BYTES,
+    parse_detached_metadata_json,
+)
 from hub.storage.objects import ContentAddressedStorage
 from hub.storage.tarball import DEFAULT_TARBALL_LIMITS, TarballLimits
 from hub.web.authors import author_authentication_dependency
@@ -38,6 +43,7 @@ from hub.web.authors import author_authentication_dependency
 _PUBLISH_REASON = "skill publication"
 _MAX_REQUEST_HEADER_CHARS = 255
 _PUBLIC_LIST_LIMIT = 100
+_HUB_ARTIFACT_METADATA_HEADER = "X-Hub-Artifact-Metadata"
 
 
 def _required_request_header(value: str | None, *, name: str) -> str:
@@ -132,6 +138,21 @@ def _not_found() -> NoReturn:
     )
 
 
+def _hub_artifact_metadata_header(skill: PublicSkillVersion) -> str:
+    metadata = json.dumps(
+        {
+            "artifact_sha256": skill.artifact_digest,
+            "schema": ARTIFACT_SIGNATURE_SCHEMA,
+            "signature": skill.artifact_signature,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    if len(metadata.encode("utf-8")) > MAX_DETACHED_METADATA_BYTES:
+        raise RuntimeError("Hub artifact metadata exceeds its response header limit")
+    return metadata
+
+
 def create_skill_router(
     author_identity_service: AuthorIdentityService,
     *,
@@ -186,7 +207,10 @@ def create_skill_router(
         return StreamingResponse(
             iter((artifact_bytes,)),
             media_type="application/gzip",
-            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{filename}",
+                _HUB_ARTIFACT_METADATA_HEADER: _hub_artifact_metadata_header(skill),
+            },
         )
 
     @router.post("", status_code=status.HTTP_201_CREATED)

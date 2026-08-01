@@ -46,6 +46,7 @@ class PublicSkillVersion:
     downloads: int
     created_at: datetime
     artifact_digest: str
+    artifact_signature: str
     byte_size: int
 
 
@@ -421,6 +422,7 @@ class HubRepository:
                     downloads=skill.downloads,
                     created_at=skill.created_at,
                     artifact_digest=artifact.artifact_digest,
+                    artifact_signature=artifact.artifact_signature,
                     byte_size=artifact.byte_size,
                 )
             )

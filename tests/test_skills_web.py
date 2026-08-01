@@ -11,6 +11,7 @@ import io
 import json
 import tarfile
 from collections.abc import Coroutine
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
@@ -23,6 +24,7 @@ from hub.db.session import Database
 from hub.integrations.scan import ScanResult
 from hub.security.author_identity import AuthorIdentityService
 from hub.security.hub_keys import HubSigningKeys
+from hub.security.signing import parse_detached_metadata_json, verify_artifact_signature
 from hub.storage.objects import ContentAddressedStorage
 from hub.storage.tarball import TarballLimits
 from hub.web.main import create_app
@@ -309,8 +311,48 @@ def test_download_returns_exact_listed_artifact_and_increments_once(
         "filename*=UTF-8''energy-1.0.0.tar.gz"
         in response.headers["content-disposition"]
     )
+    metadata = parse_detached_metadata_json(response.headers["x-hub-artifact-metadata"])
+    verify_artifact_signature(
+        response.content,
+        metadata,
+        _signing_keys().public_trust_anchors.artifact_public_key_b64,
+    )
     stored = _run(fixture.repository.get_skill(name="energy", version="1.0.0"))
     assert stored.downloads == 1
+
+
+def test_concurrent_public_downloads_return_artifact_and_count_every_response(
+    fixture: Any,
+) -> None:
+    _publish_manifest(
+        TestClient(fixture.app()), fixture, _MANIFEST_YAML, idempotency_key="parallel"
+    )
+    expected = _run(fixture.repository.get_listed_skill(name="energy", version="1.0.0"))
+    app = fixture.app()
+
+    def download() -> tuple[int, bytes, str]:
+        with TestClient(app) as client:
+            response = client.get("/api/skills/energy/download?version=1.0.0")
+        return (
+            response.status_code,
+            response.content,
+            response.headers["x-hub-artifact-metadata"],
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        responses = list(pool.map(lambda _index: download(), range(8)))
+
+    trust_anchor = _signing_keys().public_trust_anchors.artifact_public_key_b64
+    for status_code, artifact_bytes, raw_metadata in responses:
+        assert status_code == 200
+        assert artifact_bytes == fixture.storage.read(expected.artifact_digest)
+        verify_artifact_signature(
+            artifact_bytes,
+            parse_detached_metadata_json(raw_metadata),
+            trust_anchor,
+        )
+    stored = _run(fixture.repository.get_skill(name="energy", version="1.0.0"))
+    assert stored.downloads == len(responses)
 
 
 def test_download_hides_missing_or_nonpublic_versions(fixture: Any) -> None:
