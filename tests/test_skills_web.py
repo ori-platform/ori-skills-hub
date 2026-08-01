@@ -422,7 +422,7 @@ def test_concurrent_admin_transitions_allow_exactly_one_terminal_state(
                 json={"reason": f"{action} decision"},
                 headers=fixture.admin_headers(idempotency_key=f"{action}-1"),
             )
-        return response.status_code
+        return int(response.status_code)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         status_codes = list(pool.map(transition, ("approve", "reject")))
@@ -435,6 +435,44 @@ def test_concurrent_admin_transitions_allow_exactly_one_terminal_state(
     )
     assert len(history) == 2
     assert history[-1].new_status in {"listed", "rejected"}
+
+
+def test_admin_transition_trims_and_bounds_audit_reason(fixture: Any) -> None:
+    client = TestClient(fixture.app())
+    _publish_manifest(
+        client, fixture, _TIER_C_MANIFEST_YAML, idempotency_key="pending-review"
+    )
+    path = "/api/admin/skills/guarded-energy/1.0.0/approve"
+    accepted_reason = "a" * 1024
+
+    accepted = client.post(
+        path,
+        json={"reason": f"  {accepted_reason}  "},
+        headers=fixture.admin_headers(idempotency_key="max-reason"),
+    )
+    assert accepted.status_code == 200
+    history = _run(
+        fixture.repository.get_transition_history(
+            name="guarded-energy", version="1.0.0"
+        )
+    )
+    assert history[-1].reason == accepted_reason
+
+
+def test_admin_transition_rejects_oversized_audit_reason(fixture: Any) -> None:
+    client = TestClient(fixture.app())
+    _publish_manifest(
+        client, fixture, _TIER_C_MANIFEST_YAML, idempotency_key="pending-review"
+    )
+
+    rejected = client.post(
+        "/api/admin/skills/guarded-energy/1.0.0/approve",
+        json={"reason": "a" * 1025},
+        headers=fixture.admin_headers(idempotency_key="oversized-reason"),
+    )
+    assert rejected.status_code == 422
+    skill = _run(fixture.repository.get_skill(name="guarded-energy", version="1.0.0"))
+    assert skill.status == "pending_review"
 
 
 def test_download_returns_exact_listed_artifact_and_increments_once(
