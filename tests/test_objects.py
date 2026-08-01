@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -51,24 +52,47 @@ def test_store_syncs_directory_after_creating_object(
     assert synced_directory
 
 
-def test_store_does_not_sync_directory_when_adopting_existing_object(
+def test_overlapping_stores_sync_directory_before_each_returns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     storage = ContentAddressedStorage(tmp_path)
-    payload = b"already durable"
-    storage.store(payload)
-    directory_syncs = 0
-    original_fsync = os.fsync
+    payload = b"overlapping durable artifact"
+    first_sync_entered = threading.Event()
+    second_sync_entered = threading.Event()
+    release_first_sync = threading.Event()
+    release_second_sync = threading.Event()
+    sync_count = 0
+    sync_count_lock = threading.Lock()
 
-    def track_fsync(descriptor: int) -> None:
-        nonlocal directory_syncs
-        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
-            directory_syncs += 1
-        original_fsync(descriptor)
+    def block_directory_sync() -> None:
+        nonlocal sync_count
+        with sync_count_lock:
+            sync_count += 1
+            call_number = sync_count
+        if call_number == 1:
+            first_sync_entered.set()
+            assert release_first_sync.wait(timeout=5)
+        else:
+            second_sync_entered.set()
+            assert release_second_sync.wait(timeout=5)
 
-    monkeypatch.setattr(os, "fsync", track_fsync)
-    storage.store(payload)
-    assert directory_syncs == 0
+    monkeypatch.setattr(storage, "_sync_objects_directory", block_directory_sync)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_store = pool.submit(storage.store, payload)
+        assert first_sync_entered.wait(timeout=5)
+
+        second_store = pool.submit(storage.store, payload)
+        assert second_sync_entered.wait(timeout=5)
+        assert not second_store.done()
+
+        release_second_sync.set()
+        assert second_store.result(timeout=5) == _digest(payload)
+        assert not first_store.done()
+
+        release_first_sync.set()
+        assert first_store.result(timeout=5) == _digest(payload)
+
+    assert sync_count == 2
 
 
 def test_store_twice_keeps_single_object_without_temp_files(tmp_path: Path) -> None:

@@ -57,13 +57,13 @@ class ContentAddressedStorage:
                 os.fsync(handle.fileno())
             try:
                 os.link(tmp, final)
-                self._sync_objects_directory()
             except FileExistsError:
                 existing = final.read_bytes()
                 if self._digest(existing) != digest:
                     raise StorageIntegrityError(
                         "existing object bytes do not match their content address"
                     ) from None
+            self._sync_objects_directory()
         finally:
             tmp.unlink(missing_ok=True)
         return digest
