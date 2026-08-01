@@ -22,6 +22,7 @@ from hub.security.hub_keys import (
     load_hub_signing_keys_from_env,
 )
 from hub.storage.objects import ContentAddressedStorage
+from hub.web.admin import create_admin_router
 from hub.web.authors import create_author_router
 from hub.web.skills import create_skill_router
 
@@ -97,6 +98,15 @@ def create_app(
                 storage=artifact_storage,
                 signing_keys=hub_signing_keys,
                 scanner=scanner,
+            )
+        )
+        if admin_api_key is None:
+            raise ValueError("admin_api_key is required when admin routes are enabled")
+        app.include_router(
+            create_admin_router(
+                repository=skill_repository,
+                admin_api_key=admin_api_key,
+                admin_actor_id=admin_actor_id,
             )
         )
 

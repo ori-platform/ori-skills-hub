@@ -50,6 +50,19 @@ class PublicSkillVersion:
     byte_size: int
 
 
+@dataclass(frozen=True)
+class PendingSkillReview:
+    """Internal review-queue data for authenticated administrators."""
+
+    name: str
+    version: str
+    author: str
+    declares_tier_cd: bool
+    scanner_verdict: str
+    scanner_detail: str
+    created_at: datetime
+
+
 def _required(value: str, field_name: str) -> str:
     clean_value = value.strip()
     if not clean_value:
@@ -309,6 +322,31 @@ class HubRepository:
                 .limit(limit)
             )
             return self._public_skill_versions(result.tuples().all())
+
+    async def list_pending_reviews(self, *, limit: int) -> list[PendingSkillReview]:
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        async with self._database.transaction() as session:
+            result = await session.execute(
+                select(SkillVersionModel, AuthorModel, ArtifactModel)
+                .join(AuthorModel, AuthorModel.id == SkillVersionModel.author_id)
+                .join(ArtifactModel, ArtifactModel.id == SkillVersionModel.artifact_id)
+                .where(SkillVersionModel.status == SkillStatus.PENDING_REVIEW.value)
+                .order_by(SkillVersionModel.created_at, SkillVersionModel.id)
+                .limit(limit)
+            )
+            return [
+                PendingSkillReview(
+                    name=skill.name,
+                    version=skill.version,
+                    author=author.display_handle,
+                    declares_tier_cd=skill.declares_tier_cd,
+                    scanner_verdict=artifact.scanner_verdict,
+                    scanner_detail=artifact.scanner_detail,
+                    created_at=skill.created_at,
+                )
+                for skill, author, artifact in result.tuples().all()
+            ]
 
     async def list_listed_versions(self, *, name: str) -> list[PublicSkillVersion]:
         clean_name = _required(name, "name")

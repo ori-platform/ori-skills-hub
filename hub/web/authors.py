@@ -139,14 +139,10 @@ def _raise_http_error(
     ) from exc
 
 
-def create_author_router(
-    service: AuthorIdentityService,
-    *,
-    admin_api_key: str,
-    admin_actor_id: str,
-    registration_enabled: bool,
-) -> APIRouter:
-    """Build author routes around explicit trusted server configuration."""
+def admin_authentication_dependency(
+    *, admin_api_key: str, admin_actor_id: str
+) -> Callable[..., Awaitable[str]]:
+    """Return the configured admin bearer authentication dependency."""
 
     if (
         not 32 <= len(admin_api_key) <= _MAX_BEARER_LENGTH
@@ -171,8 +167,6 @@ def create_author_router(
             "admin_actor_id must be at most 255 characters without controls"
         )
 
-    router = APIRouter(prefix="/api/authors", tags=["authors"])
-
     async def require_admin(
         authorization: Annotated[str | None, Header()] = None,
     ) -> str:
@@ -184,6 +178,23 @@ def create_author_router(
                 headers={"WWW-Authenticate": "Bearer"},
             )
         return clean_admin_actor_id
+
+    return require_admin
+
+
+def create_author_router(
+    service: AuthorIdentityService,
+    *,
+    admin_api_key: str,
+    admin_actor_id: str,
+    registration_enabled: bool,
+) -> APIRouter:
+    """Build author routes around explicit trusted server configuration."""
+
+    router = APIRouter(prefix="/api/authors", tags=["authors"])
+    require_admin = admin_authentication_dependency(
+        admin_api_key=admin_api_key, admin_actor_id=admin_actor_id
+    )
 
     @router.post("/register", status_code=status.HTTP_201_CREATED)
     async def register_author(
