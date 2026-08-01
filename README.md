@@ -170,6 +170,27 @@ scanner result also remains `pending_review`, even for lower-tier skills. Hub
 admission is distribution evidence, not runtime authority: `ori-runtime`
 independently verifies the signed package before execution.
 
+## Admin Review API
+
+Review endpoints require the configured admin bearer credential plus a
+single-use `Idempotency-Key` and an operator-visible `X-Correlation-ID`.
+Every transition also requires a non-empty JSON `reason`; the authenticated
+admin actor, prior and new state, reason, correlation ID, and idempotency key
+are recorded in append-only audit history.
+
+- `GET /api/admin/skills` lists pending-review records; use `limit` (1-100) to
+  bound the result set.
+- `POST /api/admin/skills/{name}/{version}/approve` transitions a
+  `pending_review` skill to `listed`.
+- `POST /api/admin/skills/{name}/{version}/reject` transitions a
+  `pending_review` skill to `rejected`.
+- `POST /api/admin/skills/{name}/{version}/unlist` transitions a `listed`
+  skill to `unlisted` without deleting its artifact or audit history.
+
+Invalid, stale, concurrent, or replayed transitions return `409`; missing
+skills return `404`. Author bearer credentials are never accepted by these
+endpoints.
+
 ## Public Skill API
 
 Public endpoints expose only listed skill versions. Pending-review, rejected,

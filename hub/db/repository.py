@@ -34,6 +34,7 @@ _ALLOWED_PRIOR_STATUS = {
     SkillStatus.REJECTED: SkillStatus.PENDING_REVIEW,
     SkillStatus.UNLISTED: SkillStatus.LISTED,
 }
+_MAX_AUDIT_REASON_CHARS = 1024
 
 
 @dataclass(frozen=True)
@@ -50,10 +51,30 @@ class PublicSkillVersion:
     byte_size: int
 
 
+@dataclass(frozen=True)
+class PendingSkillReview:
+    """Internal review-queue data for authenticated administrators."""
+
+    name: str
+    version: str
+    author: str
+    declares_tier_cd: bool
+    scanner_verdict: str
+    scanner_detail: str
+    created_at: datetime
+
+
 def _required(value: str, field_name: str) -> str:
     clean_value = value.strip()
     if not clean_value:
         raise ValueError(f"{field_name} must not be empty")
+    return clean_value
+
+
+def _audit_reason(value: str) -> str:
+    clean_value = _required(value, "reason")
+    if len(clean_value) > _MAX_AUDIT_REASON_CHARS:
+        raise ValueError(f"reason must not exceed {_MAX_AUDIT_REASON_CHARS} characters")
     return clean_value
 
 
@@ -161,7 +182,7 @@ class HubRepository:
             actor_id=actor_id,
             prior_status=None,
             new_status=initial_status.value,
-            reason=_required(reason, "reason"),
+            reason=_audit_reason(reason),
             correlation_id=_required(correlation_id, "correlation_id"),
             idempotency_key=_required(idempotency_key, "idempotency_key"),
             artifact_digest=clean_artifact_digest,
@@ -200,7 +221,7 @@ class HubRepository:
         clean_name = _required(name, "name")
         clean_version = _required(version, "version")
         actor_id = _required(authenticated_actor_id, "authenticated_actor_id")
-        clean_reason = _required(reason, "reason")
+        clean_reason = _audit_reason(reason)
         clean_correlation_id = _required(correlation_id, "correlation_id")
         clean_idempotency_key = _required(idempotency_key, "idempotency_key")
         audit_id = new_record_id()
@@ -309,6 +330,31 @@ class HubRepository:
                 .limit(limit)
             )
             return self._public_skill_versions(result.tuples().all())
+
+    async def list_pending_reviews(self, *, limit: int) -> list[PendingSkillReview]:
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        async with self._database.transaction() as session:
+            result = await session.execute(
+                select(SkillVersionModel, AuthorModel, ArtifactModel)
+                .join(AuthorModel, AuthorModel.id == SkillVersionModel.author_id)
+                .join(ArtifactModel, ArtifactModel.id == SkillVersionModel.artifact_id)
+                .where(SkillVersionModel.status == SkillStatus.PENDING_REVIEW.value)
+                .order_by(SkillVersionModel.created_at, SkillVersionModel.id)
+                .limit(limit)
+            )
+            return [
+                PendingSkillReview(
+                    name=skill.name,
+                    version=skill.version,
+                    author=author.display_handle,
+                    declares_tier_cd=skill.declares_tier_cd,
+                    scanner_verdict=artifact.scanner_verdict,
+                    scanner_detail=artifact.scanner_detail,
+                    created_at=skill.created_at,
+                )
+                for skill, author, artifact in result.tuples().all()
+            ]
 
     async def list_listed_versions(self, *, name: str) -> list[PublicSkillVersion]:
         clean_name = _required(name, "name")

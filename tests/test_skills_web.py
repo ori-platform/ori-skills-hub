@@ -144,6 +144,14 @@ class _Fixture:
             "X-Correlation-ID": "correlation-1",
         }
 
+    @staticmethod
+    def admin_headers(*, idempotency_key: str = "review-1") -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {_ADMIN_API_KEY}",
+            "Idempotency-Key": idempotency_key,
+            "X-Correlation-ID": "review-correlation-1",
+        }
+
 
 @pytest.fixture()
 def fixture(tmp_path: Path) -> Any:
@@ -294,6 +302,177 @@ def test_public_list_and_detail_exclude_pending_review_skills(fixture: Any) -> N
     assert detail.json()["versions"][0]["version"] == "1.0.0"
 
     assert client.get("/api/skills/guarded-energy").status_code == 404
+
+
+def test_admin_review_queue_approval_and_unlisting_are_audited(fixture: Any) -> None:
+    client = TestClient(fixture.app())
+    _publish_manifest(
+        client, fixture, _TIER_C_MANIFEST_YAML, idempotency_key="pending-review"
+    )
+
+    queue = client.get("/api/admin/skills", headers=fixture.admin_headers())
+    assert queue.status_code == 200
+    assert queue.headers["cache-control"] == "no-store"
+    reviews = queue.json()["skills"]
+    assert len(reviews) == 1
+    assert reviews[0]["name"] == "guarded-energy"
+    assert reviews[0]["version"] == "1.0.0"
+    assert reviews[0]["author"] == "test-author"
+    assert reviews[0]["declares_tier_cd"] is True
+    assert reviews[0]["scanner_verdict"] == "clean"
+    assert reviews[0]["scanner_detail"] == "scanner clean"
+    assert reviews[0]["published_at"]
+
+    approved = client.post(
+        "/api/admin/skills/guarded-energy/1.0.0/approve",
+        json={"reason": "review completed"},
+        headers=fixture.admin_headers(idempotency_key="approve-1"),
+    )
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "listed"
+    assert client.get("/api/skills/guarded-energy").status_code == 200
+
+    unlisted = client.post(
+        "/api/admin/skills/guarded-energy/1.0.0/unlist",
+        json={"reason": "withdrawn after review"},
+        headers=fixture.admin_headers(idempotency_key="unlist-1"),
+    )
+    assert unlisted.status_code == 200
+    assert unlisted.json()["status"] == "unlisted"
+    assert client.get("/api/skills/guarded-energy").status_code == 404
+
+    history = _run(
+        fixture.repository.get_transition_history(
+            name="guarded-energy", version="1.0.0"
+        )
+    )
+    assert [(entry.prior_status, entry.new_status) for entry in history] == [
+        (None, "pending_review"),
+        ("pending_review", "listed"),
+        ("listed", "unlisted"),
+    ]
+    assert [entry.actor_id for entry in history[1:]] == [
+        "bootstrap-admin",
+        "bootstrap-admin",
+    ]
+
+
+def test_admin_review_rejects_author_access_and_invalid_or_replayed_transitions(
+    fixture: Any,
+) -> None:
+    client = TestClient(fixture.app())
+    _publish_manifest(
+        client, fixture, _TIER_C_MANIFEST_YAML, idempotency_key="pending-review"
+    )
+    path = "/api/admin/skills/guarded-energy/1.0.0/reject"
+
+    assert client.get("/api/admin/skills", headers=fixture.headers()).status_code == 401
+    assert (
+        client.post(
+            path,
+            json={"reason": "policy violation"},
+            headers=fixture.headers(idempotency_key="author-review"),
+        ).status_code
+        == 401
+    )
+    assert (
+        client.post(
+            path,
+            json={"reason": "   "},
+            headers=fixture.admin_headers(idempotency_key="empty-reason"),
+        ).status_code
+        == 422
+    )
+
+    rejected = client.post(
+        path,
+        json={"reason": "policy violation"},
+        headers=fixture.admin_headers(idempotency_key="reject-1"),
+    )
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == "rejected"
+    replay = client.post(
+        path,
+        json={"reason": "policy violation"},
+        headers=fixture.admin_headers(idempotency_key="reject-1"),
+    )
+    assert replay.status_code == 409
+
+    history = _run(
+        fixture.repository.get_transition_history(
+            name="guarded-energy", version="1.0.0"
+        )
+    )
+    assert len(history) == 2
+
+
+def test_concurrent_admin_transitions_allow_exactly_one_terminal_state(
+    fixture: Any,
+) -> None:
+    client = TestClient(fixture.app())
+    _publish_manifest(
+        client, fixture, _TIER_C_MANIFEST_YAML, idempotency_key="pending-review"
+    )
+    app = fixture.app()
+
+    def transition(action: str) -> int:
+        with TestClient(app) as concurrent_client:
+            response = concurrent_client.post(
+                f"/api/admin/skills/guarded-energy/1.0.0/{action}",
+                json={"reason": f"{action} decision"},
+                headers=fixture.admin_headers(idempotency_key=f"{action}-1"),
+            )
+        return int(response.status_code)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        status_codes = list(pool.map(transition, ("approve", "reject")))
+
+    assert sorted(status_codes) == [200, 409]
+    history = _run(
+        fixture.repository.get_transition_history(
+            name="guarded-energy", version="1.0.0"
+        )
+    )
+    assert len(history) == 2
+    assert history[-1].new_status in {"listed", "rejected"}
+
+
+def test_admin_transition_trims_and_bounds_audit_reason(fixture: Any) -> None:
+    client = TestClient(fixture.app())
+    _publish_manifest(
+        client, fixture, _TIER_C_MANIFEST_YAML, idempotency_key="pending-review"
+    )
+    path = "/api/admin/skills/guarded-energy/1.0.0/approve"
+    accepted_reason = "a" * 1024
+
+    accepted = client.post(
+        path,
+        json={"reason": f"  {accepted_reason}  "},
+        headers=fixture.admin_headers(idempotency_key="max-reason"),
+    )
+    assert accepted.status_code == 200
+    history = _run(
+        fixture.repository.get_transition_history(
+            name="guarded-energy", version="1.0.0"
+        )
+    )
+    assert history[-1].reason == accepted_reason
+
+
+def test_admin_transition_rejects_oversized_audit_reason(fixture: Any) -> None:
+    client = TestClient(fixture.app())
+    _publish_manifest(
+        client, fixture, _TIER_C_MANIFEST_YAML, idempotency_key="pending-review"
+    )
+
+    rejected = client.post(
+        "/api/admin/skills/guarded-energy/1.0.0/approve",
+        json={"reason": "a" * 1025},
+        headers=fixture.admin_headers(idempotency_key="oversized-reason"),
+    )
+    assert rejected.status_code == 422
+    skill = _run(fixture.repository.get_skill(name="guarded-energy", version="1.0.0"))
+    assert skill.status == "pending_review"
 
 
 def test_download_returns_exact_listed_artifact_and_increments_once(
