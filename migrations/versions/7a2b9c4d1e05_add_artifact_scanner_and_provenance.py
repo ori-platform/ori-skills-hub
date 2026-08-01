@@ -87,6 +87,15 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    artifact_count = (
+        op.get_bind().execute(sa.text("SELECT count(*) FROM artifacts")).scalar_one()
+    )
+    if artifact_count:
+        raise RuntimeError(
+            "HUB-007 cannot downgrade while publication artifacts exist; preserve "
+            "or migrate scanner and author provenance first"
+        )
+
     op.drop_column("artifacts", "author_artifact_signature")
     op.drop_column("artifacts", "author_artifact_digest")
     op.drop_column("artifacts", "scanner_detail")

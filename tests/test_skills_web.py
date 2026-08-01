@@ -189,6 +189,33 @@ def test_publish_rejects_malformed_metadata_header(fixture: Any) -> None:
     assert response.status_code == 422
 
 
+def test_publish_accepts_metadata_header_larger_than_general_header_limit(
+    fixture: Any,
+) -> None:
+    client = TestClient(fixture.app())
+    headers = fixture.headers()
+    headers["X-Author-Artifact-Metadata"] += " " * 300
+    response = client.post("/api/skills", content=fixture.upload, headers=headers)
+    assert response.status_code == 201
+
+
+def test_publish_rejects_oversized_metadata_header(fixture: Any) -> None:
+    client = TestClient(fixture.app())
+    headers = fixture.headers()
+    headers["X-Author-Artifact-Metadata"] += " " * 4097
+    response = client.post("/api/skills", content=fixture.upload, headers=headers)
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("header", ["Idempotency-Key", "X-Correlation-ID"])
+def test_publish_rejects_oversized_request_headers(fixture: Any, header: str) -> None:
+    client = TestClient(fixture.app())
+    headers = fixture.headers()
+    headers[header] = "x" * 256
+    response = client.post("/api/skills", content=fixture.upload, headers=headers)
+    assert response.status_code == 400
+
+
 def test_publish_rejects_tampered_upload(fixture: Any) -> None:
     client = TestClient(fixture.app())
     response = client.post(

@@ -26,8 +26,8 @@ from hub.core.errors import (
     PublishReplayError,
     SignatureVerificationError,
 )
-from hub.core.models import ScannerVerdict, SkillStatus
-from hub.core.publish import publish_skill
+from hub.core.models import PublishResult, ScannerVerdict, SkillStatus
+from hub.core.publish import Scanner, publish_skill
 from hub.db._models import ArtifactModel
 from hub.db.repository import HubRepository
 from hub.db.session import Database
@@ -173,11 +173,11 @@ class _Harness:
         upload_bytes: bytes,
         *,
         author_metadata: ArtifactSignatureMetadata | None = None,
-        scanner: object = None,
+        scanner: Scanner | None = None,
         idempotency_key: str = "publish-1",
         correlation_id: str = "correlation-1",
         scanner_timeout_seconds: float = 30.0,
-    ) -> Any:
+    ) -> PublishResult:
         return await publish_skill(
             upload_bytes=upload_bytes,
             author_metadata=(
@@ -295,7 +295,7 @@ def test_tier_c_skill_enters_pending_review_with_clean_scanner(
 )
 def test_non_clean_scanner_forces_pending_review_and_persists_verdict(
     tmp_path: Path,
-    scanner: object,
+    scanner: Scanner,
     expected_verdict: str,
 ) -> None:
     async def scenario() -> None:

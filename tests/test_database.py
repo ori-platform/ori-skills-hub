@@ -299,6 +299,44 @@ def test_identity_migration_refuses_to_discard_identity_history(
     assert {"author_keys", "author_identity_audit"} <= tables
 
 
+def test_hub_007_migration_refuses_to_discard_publication_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "hub.db"
+    monkeypatch.setenv("HUB_DATABASE_URL", f"sqlite:///{database_path}")
+    config = Config(str(Path(__file__).parents[1] / "alembic.ini"))
+    command.upgrade(config, "head")
+
+    async def publish() -> None:
+        database, repository, author_id = await _setup_repository(tmp_path)
+        try:
+            await _publish(repository, author_id=author_id)
+        finally:
+            await database.dispose()
+
+    _run(publish())
+
+    with pytest.raises(RuntimeError, match="cannot downgrade"):
+        command.downgrade(config, "1e9630e268d4")
+
+    with sqlite3.connect(database_path) as connection:
+        revision = connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone()
+        artifact_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(artifacts)")
+        }
+
+    assert revision == ("7a2b9c4d1e05",)
+    assert {
+        "scanner_verdict",
+        "scanner_detail",
+        "author_artifact_digest",
+        "author_artifact_signature",
+    } <= artifact_columns
+
+
 def test_publication_writes_artifact_skill_and_initial_audit_atomically(
     tmp_path: Path,
 ) -> None:

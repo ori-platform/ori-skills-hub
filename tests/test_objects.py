@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import stat
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -30,6 +31,44 @@ def test_store_returns_digest_and_writes_object(tmp_path: Path) -> None:
     assert (storage.objects_dir / digest.removeprefix("sha256:")).read_bytes() == (
         payload
     )
+
+
+def test_store_syncs_directory_after_creating_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = ContentAddressedStorage(tmp_path)
+    synced_directory = False
+    original_fsync = os.fsync
+
+    def track_fsync(descriptor: int) -> None:
+        nonlocal synced_directory
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            synced_directory = True
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", track_fsync)
+    storage.store(b"durable artifact bytes")
+    assert synced_directory
+
+
+def test_store_does_not_sync_directory_when_adopting_existing_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = ContentAddressedStorage(tmp_path)
+    payload = b"already durable"
+    storage.store(payload)
+    directory_syncs = 0
+    original_fsync = os.fsync
+
+    def track_fsync(descriptor: int) -> None:
+        nonlocal directory_syncs
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            directory_syncs += 1
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", track_fsync)
+    storage.store(payload)
+    assert directory_syncs == 0
 
 
 def test_store_twice_keeps_single_object_without_temp_files(tmp_path: Path) -> None:

@@ -29,20 +29,30 @@ from hub.storage.tarball import DEFAULT_TARBALL_LIMITS, TarballLimits
 from hub.web.authors import author_authentication_dependency
 
 _PUBLISH_REASON = "skill publication"
+_MAX_REQUEST_HEADER_CHARS = 255
 
 
-def _required_header(value: str | None, *, name: str) -> str:
+def _required_request_header(value: str | None, *, name: str) -> str:
     if value is None or not value.strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"{name} header is required",
         )
-    if len(value) > 255:
+    if len(value) > _MAX_REQUEST_HEADER_CHARS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"{name} header is too long",
         )
     return value.strip()
+
+
+def _required_metadata_header(value: str | None) -> str:
+    if value is None or not value.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="X-Author-Artifact-Metadata header is required",
+        )
+    return value
 
 
 async def _bounded_upload_bytes(request: Request, *, limit: int) -> bytes:
@@ -125,10 +135,7 @@ def create_skill_router(
         )
         try:
             author_metadata = parse_detached_metadata_json(
-                _required_header(
-                    x_author_artifact_metadata,
-                    name="X-Author-Artifact-Metadata",
-                )
+                _required_metadata_header(x_author_artifact_metadata)
             )
             result = await publish_skill(
                 upload_bytes=upload_bytes,
@@ -139,10 +146,10 @@ def create_skill_router(
                 signing_keys=signing_keys,
                 scanner=scanner,
                 reason=_PUBLISH_REASON,
-                correlation_id=_required_header(
+                correlation_id=_required_request_header(
                     correlation_id, name="X-Correlation-ID"
                 ),
-                idempotency_key=_required_header(
+                idempotency_key=_required_request_header(
                     idempotency_key, name="Idempotency-Key"
                 ),
                 tarball_limits=tarball_limits,

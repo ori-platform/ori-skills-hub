@@ -33,6 +33,15 @@ class ContentAddressedStorage:
     def _path_for(self, digest: str) -> Path:
         return self.objects_dir / digest[len(_DIGEST_PREFIX) :]
 
+    def _sync_objects_directory(self) -> None:
+        """Persist a newly linked object directory entry before returning."""
+        directory_flag = getattr(os, "O_DIRECTORY", 0)
+        descriptor = os.open(self.objects_dir, os.O_RDONLY | directory_flag)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
     def store(self, artifact_bytes: bytes) -> str:
         """Write artifact bytes once and return their content digest."""
         if not isinstance(artifact_bytes, bytes) or not artifact_bytes:
@@ -48,6 +57,7 @@ class ContentAddressedStorage:
                 os.fsync(handle.fileno())
             try:
                 os.link(tmp, final)
+                self._sync_objects_directory()
             except FileExistsError:
                 existing = final.read_bytes()
                 if self._digest(existing) != digest:
