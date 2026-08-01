@@ -5,15 +5,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import datetime
 from typing import NoReturn
 
-from sqlalchemy import insert, literal, select, update
+from sqlalchemy import Select, insert, literal, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from hub.core.models import ScannerVerdict, SkillStatus
 from hub.db._models import (
     ArtifactModel,
+    AuthorModel,
     SkillTransitionAuditModel,
     SkillVersionModel,
     new_record_id,
@@ -30,6 +34,19 @@ _ALLOWED_PRIOR_STATUS = {
     SkillStatus.REJECTED: SkillStatus.PENDING_REVIEW,
     SkillStatus.UNLISTED: SkillStatus.LISTED,
 }
+
+
+@dataclass(frozen=True)
+class PublicSkillVersion:
+    """Public, listed-only publication data for Hub read endpoints."""
+
+    name: str
+    version: str
+    author: str
+    downloads: int
+    created_at: datetime
+    artifact_digest: str
+    byte_size: int
 
 
 def _required(value: str, field_name: str) -> str:
@@ -281,6 +298,42 @@ class HubRepository:
                 session=session, name=name, version=version
             )
 
+    async def list_listed_skills(self, *, limit: int) -> list[PublicSkillVersion]:
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        async with self._database.transaction() as session:
+            result = await session.execute(
+                self._listed_skill_statement()
+                .order_by(SkillVersionModel.name, SkillVersionModel.version.desc())
+                .limit(limit)
+            )
+            return self._public_skill_versions(result.tuples().all())
+
+    async def list_listed_versions(self, *, name: str) -> list[PublicSkillVersion]:
+        clean_name = _required(name, "name")
+        async with self._database.transaction() as session:
+            result = await session.execute(
+                self._listed_skill_statement()
+                .where(SkillVersionModel.name == clean_name)
+                .order_by(SkillVersionModel.version.desc())
+            )
+            return self._public_skill_versions(result.tuples().all())
+
+    async def get_listed_skill(self, *, name: str, version: str) -> PublicSkillVersion:
+        clean_name = _required(name, "name")
+        clean_version = _required(version, "version")
+        async with self._database.transaction() as session:
+            result = await session.execute(
+                self._listed_skill_statement().where(
+                    SkillVersionModel.name == clean_name,
+                    SkillVersionModel.version == clean_version,
+                )
+            )
+            records = self._public_skill_versions(result.tuples().all())
+        if not records:
+            raise RecordNotFoundError(f"listed skill {name}@{version} was not found")
+        return records[0]
+
     async def publication_recorded_for_idempotency_key(
         self, *, actor_id: str, idempotency_key: str
     ) -> bool:
@@ -342,6 +395,36 @@ class HubRepository:
         if skill is None:
             raise RecordNotFoundError(f"skill {name}@{version} was not found")
         return skill
+
+    @staticmethod
+    def _listed_skill_statement() -> Select[
+        tuple[SkillVersionModel, AuthorModel, ArtifactModel]
+    ]:
+        return (
+            select(SkillVersionModel, AuthorModel, ArtifactModel)
+            .join(AuthorModel, AuthorModel.id == SkillVersionModel.author_id)
+            .join(ArtifactModel, ArtifactModel.id == SkillVersionModel.artifact_id)
+            .where(SkillVersionModel.status == SkillStatus.LISTED.value)
+        )
+
+    @staticmethod
+    def _public_skill_versions(
+        rows: Sequence[tuple[SkillVersionModel, AuthorModel, ArtifactModel]],
+    ) -> list[PublicSkillVersion]:
+        records: list[PublicSkillVersion] = []
+        for skill, author, artifact in rows:
+            records.append(
+                PublicSkillVersion(
+                    name=skill.name,
+                    version=skill.version,
+                    author=author.display_handle,
+                    downloads=skill.downloads,
+                    created_at=skill.created_at,
+                    artifact_digest=artifact.artifact_digest,
+                    byte_size=artifact.byte_size,
+                )
+            )
+        return records
 
     async def _raise_transition_failure(
         self,
