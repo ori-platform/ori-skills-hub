@@ -21,16 +21,31 @@ from hub.security.hub_keys import (
     HubSigningKeys,
     load_hub_signing_keys_from_env,
 )
+from hub.security.signing import ARTIFACT_SIGNATURE_SCHEMA, SIGNING_VECTOR_SHA256
 from hub.storage.objects import ContentAddressedStorage
 from hub.web.admin import create_admin_router
 from hub.web.authors import create_author_router
 from hub.web.skills import create_skill_router
 
+_SKILL_PACKAGE_CONTRACT_VERSION = "v1"
+_SIGNING_CONTRACT_VERSION = "v1"
+
 
 def health_payload(
     *, trust_anchors: HubPublicTrustAnchors | None = None
 ) -> dict[str, object]:
-    payload: dict[str, object] = {"status": "ok", "version": __version__}
+    payload: dict[str, object] = {
+        "status": "ok",
+        "version": __version__,
+        "contract_compatibility": {
+            "skill_package": {"version": _SKILL_PACKAGE_CONTRACT_VERSION},
+            "signing": {
+                "version": _SIGNING_CONTRACT_VERSION,
+                "artifact_signature_schema": ARTIFACT_SIGNATURE_SCHEMA,
+                "vector_sha256": SIGNING_VECTOR_SHA256,
+            },
+        },
+    }
     if trust_anchors is not None:
         payload["signing_trust_anchors"] = trust_anchors.as_dict()
     return payload
@@ -126,8 +141,9 @@ def create_configured_app() -> Any:
         database,
         token_ttl_seconds=config.author_token_ttl_seconds,
     )
-    signing_keys = load_hub_signing_keys_from_env(publish_capable=False)
-    publish_enabled = signing_keys is not None
+    signing_keys = load_hub_signing_keys_from_env(
+        publish_capable=config.publish_enabled
+    )
 
     @asynccontextmanager
     async def lifespan(_app: Any) -> AsyncIterator[None]:
@@ -144,15 +160,17 @@ def create_configured_app() -> Any:
         admin_api_key=config.admin_api_key,
         admin_actor_id=config.admin_actor_id,
         author_registration_enabled=config.author_registration_enabled,
-        skill_repository=HubRepository(database) if publish_enabled else None,
+        skill_repository=HubRepository(database) if config.publish_enabled else None,
         artifact_storage=(
             ContentAddressedStorage(config.storage_local_dir)
-            if publish_enabled
+            if config.publish_enabled
             else None
         ),
         hub_signing_keys=signing_keys,
         scanner=(
-            VirusTotalScanner(config.virustotal_api_key) if publish_enabled else None
+            VirusTotalScanner(config.virustotal_api_key)
+            if config.publish_enabled
+            else None
         ),
         lifespan=lifespan,
     )

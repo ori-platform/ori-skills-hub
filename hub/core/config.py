@@ -22,9 +22,8 @@ class HubConfig:
     admin_actor_id: str
     author_registration_enabled: bool
     author_token_ttl_seconds: int
+    publish_enabled: bool
     virustotal_api_key: str | None = field(repr=False)
-    runtime_baseline: str
-    specs_baseline: str
 
 
 def _boolean_env(name: str, *, default: bool) -> bool:
@@ -73,6 +72,7 @@ def load_from_env() -> HubConfig:
         "HUB_AUTHOR_REGISTRATION_ENABLED",
         default=False,
     )
+    publish_enabled = _boolean_env("HUB_PUBLISH_ENABLED", default=False)
 
     admin_actor_id = environ.get("HUB_ADMIN_ACTOR_ID", "bootstrap-admin").strip()
     if not admin_actor_id:
@@ -93,6 +93,8 @@ def load_from_env() -> HubConfig:
         )
 
     virustotal = environ.get("HUB_VIRUSTOTAL_API_KEY", "").strip() or None
+    if publish_enabled and virustotal is None:
+        raise ConfigError("HUB_PUBLISH_ENABLED requires HUB_VIRUSTOTAL_API_KEY")
     return HubConfig(
         env=environ.get("HUB_ENV", "development"),
         database_url=environ.get(
@@ -106,7 +108,6 @@ def load_from_env() -> HubConfig:
         admin_actor_id=admin_actor_id,
         author_registration_enabled=registration_enabled,
         author_token_ttl_seconds=token_ttl_seconds,
+        publish_enabled=publish_enabled,
         virustotal_api_key=virustotal,
-        runtime_baseline=environ.get("HUB_RUNTIME_BASELINE", "v0.9.0-beta.2"),
-        specs_baseline=environ.get("HUB_SPECS_BASELINE", "v1"),
     )

@@ -18,14 +18,15 @@ def test_load_from_env_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("HUB_ADMIN_ACTOR_ID", raising=False)
     monkeypatch.delenv("HUB_AUTHOR_REGISTRATION_ENABLED", raising=False)
     monkeypatch.delenv("HUB_AUTHOR_TOKEN_TTL_SECONDS", raising=False)
+    monkeypatch.delenv("HUB_PUBLISH_ENABLED", raising=False)
 
     cfg = load_from_env()
 
     assert cfg.storage_backend == "local"
-    assert cfg.runtime_baseline == "v0.9.0-beta.2"
     assert cfg.admin_actor_id == "bootstrap-admin"
     assert cfg.author_registration_enabled is False
     assert cfg.author_token_ttl_seconds == 2_592_000
+    assert cfg.publish_enabled is False
     assert cfg.admin_api_key not in repr(cfg)
 
 
@@ -36,6 +37,7 @@ def test_load_from_env_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
         ("HUB_AUTHOR_TOKEN_TTL_SECONDS", "not-an-integer"),
         ("HUB_AUTHOR_TOKEN_TTL_SECONDS", "299"),
         ("HUB_AUTHOR_TOKEN_TTL_SECONDS", "7776001"),
+        ("HUB_PUBLISH_ENABLED", "sometimes"),
     ],
 )
 def test_load_from_env_rejects_invalid_author_identity_config(
@@ -103,3 +105,14 @@ def test_load_from_env_enables_author_registration_explicitly(
     assert cfg.admin_actor_id == "security-operator"
     assert cfg.author_registration_enabled is True
     assert cfg.author_token_ttl_seconds == 3600
+
+
+def test_load_from_env_requires_scanner_key_for_publish_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HUB_ADMIN_API_KEY", "a" * 32)
+    monkeypatch.setenv("HUB_PUBLISH_ENABLED", "true")
+    monkeypatch.delenv("HUB_VIRUSTOTAL_API_KEY", raising=False)
+
+    with pytest.raises(ConfigError, match="HUB_VIRUSTOTAL_API_KEY"):
+        load_from_env()

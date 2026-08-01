@@ -41,6 +41,11 @@ Relevant contracts:
 - [`skills-package/v1`](https://github.com/ori-platform/ori-specs/blob/main/skills-package/v1.md)
 - [`signing/v1`](https://github.com/ori-platform/ori-specs/blob/main/signing/v1.md)
 
+`GET /health` reports the Hub release version and its supported skill-package
+and signing contract compatibility. Signing compatibility includes the artifact
+metadata schema and pinned signing-vector SHA-256; it never reports a runtime
+release number, secrets, or raw deployment configuration.
+
 ## Package Layout
 
 ```text
@@ -252,6 +257,11 @@ inject environment values directly. File and inline sources cannot be mixed
 for the same key, and shared-root material cannot be combined with
 profile-specific material. Publish-capable startup fails closed when sources
 are missing, partial, malformed, or ambiguous. Read-only mode may omit them.
+
+Set `HUB_PUBLISH_ENABLED=true` to mount the publish, public skill, and admin
+review routes. This mode also requires `HUB_VIRUSTOTAL_API_KEY`; startup fails
+closed if either the scanner key or a complete signing-key configuration is
+absent. Leave it unset or `false` for explicit read-only operation.
 
 Only `manifest_public_key_b64` and `artifact_public_key_b64` are exposed by the
 safe trust-anchor and health surfaces. The shared signing vector corpus is
