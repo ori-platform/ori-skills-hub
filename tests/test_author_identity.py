@@ -18,6 +18,7 @@ from httpx import Response as HttpxResponse
 from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
+from hub.core.errors import ConfigError
 from hub.db import Database
 from hub.db._identity_repository import AuthorIdentityRepository
 from hub.db._models import (
@@ -881,6 +882,59 @@ def test_environment_backed_app_factory_exposes_author_routes(
     assert isinstance(configured_app.state.hub_database, Database)
 
     _run(configured_app.state.hub_database.dispose())
+
+
+def test_configured_publish_app_lifespan_starts_and_disposes_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HUB_ADMIN_API_KEY", _ADMIN_KEY)
+    monkeypatch.setenv("HUB_DATABASE_URL", f"sqlite:///{tmp_path / 'hub.db'}")
+    monkeypatch.setenv("HUB_STORAGE_LOCAL_DIR", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("HUB_PUBLISH_ENABLED", "true")
+    monkeypatch.setenv("HUB_VIRUSTOTAL_API_KEY", "scanner-key")
+    monkeypatch.setenv("HUB_ROOT_SIGNING_PRIVATE_KEY_B64", _KEY_ONE)
+
+    configured_app = create_configured_app()
+    database = configured_app.state.hub_database
+    dispose_calls = 0
+    original_dispose = database.dispose
+
+    async def tracked_dispose() -> None:
+        nonlocal dispose_calls
+        dispose_calls += 1
+        await original_dispose()
+
+    monkeypatch.setattr(database, "dispose", tracked_dispose)
+
+    async def scenario() -> None:
+        async with configured_app.router.lifespan_context(configured_app):
+            paths = {route.path for route in configured_app.routes}
+            assert {
+                "/api/authors/register",
+                "/api/skills",
+                "/api/admin/skills",
+            }.issubset(paths)
+
+    _run(scenario())
+    assert dispose_calls == 1
+
+
+def test_configured_publish_app_requires_signing_material(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HUB_ADMIN_API_KEY", _ADMIN_KEY)
+    monkeypatch.setenv("HUB_PUBLISH_ENABLED", "true")
+    monkeypatch.setenv("HUB_VIRUSTOTAL_API_KEY", "scanner-key")
+    monkeypatch.delenv("HUB_ROOT_SIGNING_PRIVATE_KEY_B64", raising=False)
+    monkeypatch.delenv("HUB_ROOT_SIGNING_PRIVATE_KEY_FILE", raising=False)
+    monkeypatch.delenv("HUB_MANIFEST_SIGNING_PRIVATE_KEY_B64", raising=False)
+    monkeypatch.delenv("HUB_MANIFEST_SIGNING_PRIVATE_KEY_FILE", raising=False)
+    monkeypatch.delenv("HUB_ARTIFACT_SIGNING_PRIVATE_KEY_B64", raising=False)
+    monkeypatch.delenv("HUB_ARTIFACT_SIGNING_PRIVATE_KEY_FILE", raising=False)
+
+    with pytest.raises(ConfigError, match="publish-capable mode requires"):
+        create_configured_app()
 
 
 def test_registration_endpoint_fails_closed_and_never_caches_token(

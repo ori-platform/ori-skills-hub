@@ -27,6 +27,7 @@ from hub.security.hub_keys import (
     main,
 )
 from hub.security.signing import (
+    SIGNING_VECTOR_SHA256,
     verify_artifact_signature,
     verify_manifest_signature,
 )
@@ -435,6 +436,14 @@ def test_health_exposes_only_profile_public_anchors() -> None:
     rendered = repr(payload)
 
     assert payload["signing_trust_anchors"] == keys.public_trust_anchors.as_dict()
+    assert payload["contract_compatibility"] == {
+        "skill_package": {"version": "v1"},
+        "signing": {
+            "version": "v1",
+            "artifact_signature_schema": "ori.skill_artifact_signature.v1",
+            "vector_sha256": SIGNING_VECTOR_SHA256,
+        },
+    }
     assert _SEED_ONE not in rendered
     assert _SEED_TWO not in rendered
 
@@ -461,6 +470,9 @@ def test_health_route_exposes_only_profile_public_anchors() -> None:
     assert response.json()["signing_trust_anchors"] == {
         "manifest_public_key_b64": (keys.public_trust_anchors.manifest_public_key_b64),
         "artifact_public_key_b64": (keys.public_trust_anchors.artifact_public_key_b64),
+    }
+    assert response.json()["contract_compatibility"]["skill_package"] == {
+        "version": "v1"
     }
     assert _SEED_ONE not in response.text
     assert _SEED_TWO not in response.text
