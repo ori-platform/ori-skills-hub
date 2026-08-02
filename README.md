@@ -315,21 +315,57 @@ their commercial workflow and comply with the applicable
 a community/public API key is not sufficient authorization for commercial Hub
 operation.
 
-The scanner has an eight-second per-request timeout, a 25-second total scan
-budget, and exponential polling backoff capped at four seconds. A result is
+Production publication uses durable asynchronous orchestration. After author
+authentication, exact-byte signature verification, bounded validation, Hub
+signing, and immutable storage, the Hub atomically creates a non-public
+publication and a `pending_submission` scan job. The HTTP request returns
+`202 Accepted`; a background worker later submits the verified author archive
+and polls one analysis response per leased attempt. Publish requests never wait
+for VirusTotal queueing or polling.
+
+Jobs use atomic, expiring worker leases, bounded exponential backoff with
+jitter, bounded `Retry-After`, an attempt budget, and a maximum lifetime. Every
+state and evidence change is recorded. Expired leases are recoverable after a
+worker or service restart. Shutdown cancels the local worker without deleting
+jobs or leases; any active lease expires and another worker can recover it.
+Provider submission is at-least-once when termination happens after VirusTotal
+accepts a sample but before its opaque analysis ID commits. Duplicate provider
+submission cannot duplicate the Hub publication, scan job, evidence-driven
+visibility transition, or audit record.
+
+The exact verified author upload is retained in content-addressed local storage
+as durable scanner input and evidence, including when the eventual verdict is
+malicious. It is never served by public download routes. Operators must include
+this non-public evidence store in their retention and deletion policy; automated
+retention cleanup is not yet implemented.
+
+A result is
 `clean` only when VirusTotal reports a completed analysis, zero malicious and
 suspicious detections, and a strict majority of affirmative `harmless` results
 over all `undetected`, failed, timed-out, confirmed-timeout, and unsupported
 engine outcomes. An all-`undetected` result, a tie, or an inconclusive majority
 requires manual review. Malicious detections return `malicious`; suspicious,
 inconclusive, malformed, timed-out, rate-limited, authentication-failed, and
-other unavailable outcomes return `pending_manual_review`.
+other unavailable outcomes remain non-public for retry or manual review.
+
+Clean Tier A/B publications are listed only after the normalized evidence is
+durable and the existing append-only audit transition commits in the same
+transaction. Clean Tier C/D publications remain pending manual review.
+Malicious publications are rejected through the same audited transition path.
+Exhausted, suspicious, malformed, rate-limited, authentication-failed, and
+unavailable jobs never list automatically.
 
 Without an API key the scanner records `skipped`. Under the Hub listing policy,
 both `skipped` and `pending_manual_review` keep an upload pending for a human
 decision; scanner unavailability never produces an automatic listing. API keys
 are sent only in the VirusTotal `x-apikey` request header and are not included in
 scanner results or logs.
+
+Authenticated authors can query the bounded, non-secret scan status URL returned
+by publication. Administrators can inspect `/api/admin/skills/scan-metrics` for
+queue depth, oldest age, attempts, verdict counts, rate limits, exhausted jobs,
+and worker latency. Provider analysis identifiers, raw provider responses,
+author credentials, API keys, and private signing material are not exposed.
 
 ## Security Gate
 

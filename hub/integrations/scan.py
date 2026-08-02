@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from math import isfinite
 from time import monotonic as _monotonic
 from time import sleep as _sleep
@@ -17,6 +19,7 @@ import httpx
 _VIRUSTOTAL_API_URL: Final = "https://www.virustotal.com/api/v3"
 _UPLOAD_URL: Final = f"{_VIRUSTOTAL_API_URL}/files"
 _MAX_DIRECT_UPLOAD_BYTES: Final = 32 * 1024 * 1024
+_MAX_PROVIDER_RESPONSE_BYTES: Final = 1024 * 1024
 
 _DEFAULT_REQUEST_TIMEOUT_SECONDS: Final = 8.0
 _DEFAULT_MAX_WAIT_SECONDS: Final = 25.0
@@ -44,6 +47,31 @@ class _ScanDeadlineExceeded(TimeoutError):
 class ScanResult:
     status: str
     detail: str
+
+
+@dataclass(frozen=True)
+class PollResult:
+    completed: bool
+    result: ScanResult | None
+    stats: dict[str, int]
+
+
+class ScannerProviderError(RuntimeError):
+    """Bounded, secret-free provider failure safe for orchestration."""
+
+
+class ScannerAuthenticationError(ScannerProviderError):
+    """Provider credentials were rejected; retry only with a long delay."""
+
+
+class ScannerRateLimitError(ScannerProviderError):
+    def __init__(self, retry_after_seconds: float) -> None:
+        super().__init__("VirusTotal rate limit reached")
+        self.retry_after_seconds = retry_after_seconds
+
+
+class ScannerTemporaryError(ScannerProviderError):
+    """Provider timeout or availability failure."""
 
 
 class VirusTotalScanner:
@@ -131,6 +159,98 @@ class VirusTotalScanner:
         except Exception:
             return _pending("VirusTotal scanner failed unexpectedly")
 
+    def submit(self, payload: bytes) -> str:
+        """Submit one verified immutable sample without polling it."""
+
+        if not self._api_key:
+            raise ScannerAuthenticationError("VirusTotal API key is not configured")
+        if not payload or len(payload) > _MAX_DIRECT_UPLOAD_BYTES:
+            raise ScannerProviderError("archive cannot be submitted to VirusTotal")
+        try:
+            with self._client() as client:
+                response = client.post(
+                    _UPLOAD_URL,
+                    files={
+                        "file": (
+                            "skill-package.tar.gz",
+                            payload,
+                            "application/gzip",
+                        )
+                    },
+                    timeout=self._request_timeout_seconds,
+                )
+                self._raise_provider_status(response)
+                return _analysis_id_from_upload(response)
+        except ScannerProviderError:
+            raise
+        except httpx.TimeoutException as exc:
+            raise ScannerTemporaryError("VirusTotal request timed out") from exc
+        except httpx.HTTPError as exc:
+            raise ScannerTemporaryError("VirusTotal request failed") from exc
+        except _InvalidVirusTotalResponse as exc:
+            raise ScannerProviderError(
+                "VirusTotal returned an invalid response"
+            ) from exc
+
+    def poll_once(self, analysis_id: str) -> PollResult:
+        """Poll one opaque analysis identifier exactly once."""
+
+        if not self._api_key:
+            raise ScannerAuthenticationError("VirusTotal API key is not configured")
+        safe_id = _provider_id(analysis_id)
+        url = f"{_VIRUSTOTAL_API_URL}/analyses/{quote(safe_id, safe='')}"
+        try:
+            with self._client() as client:
+                response = client.get(url, timeout=self._request_timeout_seconds)
+                self._raise_provider_status(response)
+                status, raw_stats = _analysis_state(response, expected_id=safe_id)
+                if status in {"queued", "in-progress"}:
+                    return PollResult(completed=False, result=None, stats={})
+                if status != "completed":
+                    raise ScannerProviderError(
+                        "VirusTotal returned an unknown analysis status"
+                    )
+                stats = _normalised_stats(raw_stats)
+                return PollResult(
+                    completed=True,
+                    result=_completed_verdict(raw_stats),
+                    stats=stats,
+                )
+        except ScannerProviderError:
+            raise
+        except httpx.TimeoutException as exc:
+            raise ScannerTemporaryError("VirusTotal request timed out") from exc
+        except httpx.HTTPError as exc:
+            raise ScannerTemporaryError("VirusTotal request failed") from exc
+        except _InvalidVirusTotalResponse as exc:
+            raise ScannerProviderError(
+                "VirusTotal returned an invalid response"
+            ) from exc
+
+    def _client(self) -> httpx.Client:
+        if self._api_key is None:
+            raise ScannerAuthenticationError("VirusTotal API key is not configured")
+        return httpx.Client(
+            headers={"accept": "application/json", "x-apikey": self._api_key},
+            follow_redirects=False,
+            transport=self._transport,
+        )
+
+    @staticmethod
+    def _raise_provider_status(response: httpx.Response) -> None:
+        if response.status_code in {401, 403}:
+            raise ScannerAuthenticationError("VirusTotal authentication failed")
+        if response.status_code == 429:
+            raise ScannerRateLimitError(_retry_after_seconds(response))
+        if response.status_code >= 500:
+            raise ScannerTemporaryError(
+                f"VirusTotal service returned HTTP {response.status_code}"
+            )
+        if response.is_error:
+            raise ScannerProviderError(
+                f"VirusTotal request returned HTTP {response.status_code}"
+            )
+
     def _poll(
         self,
         client: httpx.Client,
@@ -180,6 +300,8 @@ def _positive_seconds(value: float, *, name: str) -> float:
 
 
 def _json_object(response: httpx.Response) -> dict[str, object]:
+    if len(response.content) > _MAX_PROVIDER_RESPONSE_BYTES:
+        raise _InvalidVirusTotalResponse("provider response exceeds size limit")
     try:
         payload = cast(object, response.json())
     except ValueError as exc:
@@ -201,7 +323,34 @@ def _analysis_id_from_upload(response: httpx.Response) -> str:
     analysis_id = data.get("id")
     if not isinstance(analysis_id, str) or not analysis_id:
         raise _InvalidVirusTotalResponse("analysis id is missing")
-    return analysis_id
+    return _provider_id(analysis_id)
+
+
+def _provider_id(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 512
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ScannerProviderError("VirusTotal analysis identifier is invalid")
+    return value
+
+
+def _retry_after_seconds(response: httpx.Response) -> float:
+    raw = response.headers.get("retry-after", "").strip()
+    if raw.isdigit():
+        return float(min(max(int(raw), 1), 300))
+    if raw:
+        try:
+            retry_at = parsedate_to_datetime(raw)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            delay = (retry_at - datetime.now(UTC)).total_seconds()
+            return min(max(delay, 1.0), 300.0)
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return 60.0
 
 
 def _analysis_state(
@@ -262,6 +411,13 @@ def _completed_verdict(stats: dict[str, object] | None) -> ScanResult:
             f"(harmless={harmless}, inconclusive={inconclusive})"
         ),
     )
+
+
+def _normalised_stats(stats: dict[str, object] | None) -> dict[str, int]:
+    if stats is None:
+        raise _InvalidVirusTotalResponse("completed analysis has no stats")
+    names = ("malicious", "suspicious", "harmless", *_INCONCLUSIVE_STAT_NAMES)
+    return {name: _non_negative_count(stats, name) for name in names}
 
 
 def _non_negative_count(stats: dict[str, object], name: str) -> int:

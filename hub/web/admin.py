@@ -11,12 +11,14 @@ from typing import Annotated, NoReturn
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 
 from hub.core.models import SkillStatus
+from hub.core.scan_worker import WorkerMetrics
 from hub.db.errors import (
     InvalidStateTransitionError,
     PersistenceConflictError,
     RecordNotFoundError,
 )
 from hub.db.repository import HubRepository, PendingSkillReview
+from hub.db.scans import ScanRepository
 from hub.web.authors import _required_header, admin_authentication_dependency
 
 _REVIEW_LIST_LIMIT = 100
@@ -58,7 +60,12 @@ def _raise_transition_error(
 
 
 def create_admin_router(
-    *, repository: HubRepository, admin_api_key: str, admin_actor_id: str
+    *,
+    repository: HubRepository,
+    admin_api_key: str,
+    admin_actor_id: str,
+    scan_repository: ScanRepository | None = None,
+    worker_metrics: WorkerMetrics | None = None,
 ) -> APIRouter:
     """Build administrator-only review queue and state-transition routes."""
 
@@ -76,6 +83,36 @@ def create_admin_router(
         _no_store(response)
         reviews = await repository.list_pending_reviews(limit=limit)
         return {"skills": [_pending_review_payload(review) for review in reviews]}
+
+    @router.get("/scan-metrics")
+    async def scan_metrics(
+        response: Response,
+        _actor_id: str = Depends(require_admin),
+    ) -> dict[str, object]:
+        if scan_repository is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="scanner orchestration is not enabled",
+            )
+        _no_store(response)
+        queue = await scan_repository.metrics()
+        runtime = worker_metrics or WorkerMetrics()
+        return {
+            "queue_depth": queue.queue_depth,
+            "oldest_age_seconds": queue.oldest_age_seconds,
+            "total_attempts": queue.total_attempts,
+            "exhausted_jobs": queue.exhausted_jobs,
+            "verdict_counts": dict(queue.verdict_counts),
+            "worker": {
+                "claims": runtime.claims,
+                "submissions": runtime.submissions,
+                "polls": runtime.polls,
+                "rate_limits": runtime.rate_limits,
+                "exhausted": runtime.exhausted,
+                "completed": runtime.completed,
+                "last_latency_seconds": runtime.last_latency_seconds,
+            },
+        }
 
     async def transition(
         *,

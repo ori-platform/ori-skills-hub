@@ -9,7 +9,16 @@ import json
 from typing import Annotated, NoReturn
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from fastapi.responses import StreamingResponse
 
 from hub.core.errors import (
@@ -29,6 +38,7 @@ from hub.db.errors import (
     RecordNotFoundError,
 )
 from hub.db.repository import HubRepository, PublicSkillVersion
+from hub.db.scans import ScanRepository
 from hub.security.author_identity import AuthenticatedAuthor, AuthorIdentityService
 from hub.security.hub_keys import HubSigningKeys
 from hub.security.signing import (
@@ -111,13 +121,22 @@ def _raise_http_error(
 
 
 def _publish_payload(result: PublishResult) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "name": result.name,
         "version": result.version,
         "status": result.status.value,
         "artifact_digest": result.artifact_digest,
         "manifest_digest": result.manifest_digest,
     }
+    if result.scan_job_id is not None and result.scanner_state is not None:
+        payload.update(
+            {
+                "scan_job_id": result.scan_job_id,
+                "scanner_state": result.scanner_state.value,
+                "scan_status_url": f"/api/skills/scans/{result.scan_job_id}",
+            }
+        )
+    return payload
 
 
 def _public_skill_payload(skill: PublicSkillVersion) -> dict[str, object]:
@@ -160,6 +179,7 @@ def create_skill_router(
     storage: ContentAddressedStorage,
     signing_keys: HubSigningKeys,
     scanner: Scanner,
+    scan_repository: ScanRepository | None = None,
     tarball_limits: TarballLimits = DEFAULT_TARBALL_LIMITS,
 ) -> APIRouter:
     """Build publish routes around explicit trusted server components."""
@@ -173,6 +193,34 @@ def create_skill_router(
     ) -> dict[str, object]:
         skills = await repository.list_listed_skills(limit=limit)
         return {"skills": [_public_skill_payload(skill) for skill in skills]}
+
+    @router.get("/scans/{job_id}")
+    async def scan_status(
+        job_id: str,
+        actor: AuthenticatedAuthor = Depends(require_author),  # noqa: B008
+    ) -> dict[str, object]:
+        if scan_repository is None:
+            _not_found()
+        try:
+            job = await scan_repository.get(job_id)
+        except RecordNotFoundError:
+            _not_found()
+        if job.author_id != actor.actor_id:
+            _not_found()
+        return {
+            "scan_job_id": job.id,
+            "name": job.name,
+            "version": job.version,
+            "state": job.state.value,
+            "attempt_count": job.attempt_count,
+            "verdict": job.verdict,
+            "detail": job.detail,
+            "created_at": job.created_at.isoformat(),
+            "updated_at": job.updated_at.isoformat(),
+            "completed_at": (
+                job.completed_at.isoformat() if job.completed_at is not None else None
+            ),
+        }
 
     @router.get("/{name}")
     async def skill_detail(name: str) -> dict[str, object]:
@@ -213,9 +261,18 @@ def create_skill_router(
             },
         )
 
-    @router.post("", status_code=status.HTTP_201_CREATED)
+    @router.post(
+        "",
+        status_code=status.HTTP_201_CREATED,
+        responses={
+            status.HTTP_202_ACCEPTED: {
+                "description": "Publication admitted for asynchronous scanning"
+            }
+        },
+    )
     async def publish(
         request: Request,
+        response: Response,
         actor: AuthenticatedAuthor = Depends(require_author),  # noqa: B008
         x_author_artifact_metadata: Annotated[
             str | None, Header(alias="X-Author-Artifact-Metadata")
@@ -246,6 +303,7 @@ def create_skill_router(
                     idempotency_key, name="Idempotency-Key"
                 ),
                 tarball_limits=tarball_limits,
+                defer_scan=scan_repository is not None,
             )
         except (
             SignatureVerificationError,
@@ -257,6 +315,8 @@ def create_skill_router(
             PersistenceConflictError,
         ) as exc:
             _raise_http_error(exc)
+        if scan_repository is not None:
+            response.status_code = status.HTTP_202_ACCEPTED
         return _publish_payload(result)
 
     return router

@@ -9,7 +9,13 @@ import httpx
 import pytest
 
 import hub.integrations.scan as scan_module
-from hub.integrations.scan import ScanResult, VirusTotalScanner
+from hub.integrations.scan import (
+    ScannerProviderError,
+    ScannerRateLimitError,
+    ScannerTemporaryError,
+    ScanResult,
+    VirusTotalScanner,
+)
 
 _API_KEY = "vt-test-api-key"
 _ANALYSIS_ID = "analysis-id"
@@ -108,6 +114,69 @@ def test_scan_clean() -> None:
     assert "harmless=52" in result.detail
     assert "inconclusive=8" in result.detail
     assert [request.method for request in requests] == ["POST", "GET"]
+
+
+def test_async_transport_splits_submission_from_single_poll() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST":
+            return _upload_response(request)
+        return _analysis_response(request, status="queued")
+
+    scanner = _scanner(handler)
+    analysis_id = scanner.submit(b"archive-bytes")
+    assert [request.method for request in requests] == ["POST"]
+
+    outcome = scanner.poll_once(analysis_id)
+    assert outcome.completed is False
+    assert outcome.result is None
+    assert [request.method for request in requests] == ["POST", "GET"]
+
+
+def test_async_transport_honours_bounded_retry_after() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, request=request, headers={"Retry-After": "9999"})
+
+    with pytest.raises(ScannerRateLimitError) as exc_info:
+        _scanner(handler).submit(b"archive-bytes")
+
+    assert exc_info.value.retry_after_seconds == 300
+    assert _API_KEY not in str(exc_info.value)
+    assert _API_KEY not in repr(exc_info.value)
+
+
+def test_async_transport_rejects_malformed_response_without_raw_body() -> None:
+    secret_body = f"provider failure {_API_KEY}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request, text=secret_body)
+
+    with pytest.raises(ScannerProviderError) as exc_info:
+        _scanner(handler).submit(b"archive-bytes")
+
+    assert secret_body not in str(exc_info.value)
+    assert _API_KEY not in str(exc_info.value)
+
+
+def test_async_transport_rejects_oversized_provider_response() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request, content=b"x" * (1024 * 1024 + 1))
+
+    with pytest.raises(ScannerProviderError, match="invalid response"):
+        _scanner(handler).submit(b"archive-bytes")
+
+
+def test_async_transport_timeout_is_bounded_and_secret_free() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout(f"timeout {_API_KEY}", request=request)
+
+    with pytest.raises(ScannerTemporaryError) as exc_info:
+        _scanner(handler).submit(b"archive-bytes")
+
+    assert str(exc_info.value) == "VirusTotal request timed out"
+    assert _API_KEY not in repr(exc_info.value)
 
 
 def test_scan_malicious() -> None:
