@@ -293,6 +293,7 @@ class AuthorIdentityService:
         self,
         *,
         author_id: str,
+        expected_identity_revision: int,
         authenticated_actor_id: str,
         reason: str,
         correlation_id: str,
@@ -313,6 +314,7 @@ class AuthorIdentityService:
             credential_lookup_id=lookup_id,
             credential_hash=credential_hash,
             credential_expires_at=expires_at,
+            expected_identity_revision=_identity_revision(expected_identity_revision),
             authenticated_actor_id=_clean_text(
                 authenticated_actor_id,
                 field_name="authenticated_actor_id",

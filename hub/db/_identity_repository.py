@@ -208,6 +208,7 @@ class AuthorIdentityRepository:
         credential_lookup_id: str,
         credential_hash: str,
         credential_expires_at: datetime,
+        expected_identity_revision: int,
         authenticated_actor_id: str,
         reason: str,
         correlation_id: str,
@@ -219,6 +220,11 @@ class AuthorIdentityRepository:
         clean_reason = _required(reason, "reason")
         clean_correlation_id = _required(correlation_id, "correlation_id")
         clean_idempotency_key = _required(idempotency_key, "idempotency_key")
+        if (
+            type(expected_identity_revision) is not int
+            or expected_identity_revision < 1
+        ):
+            raise ValueError("expected_identity_revision must be a positive integer")
         credential = AuthorCredentialModel(
             id=new_record_id(),
             author_id=clean_author_id,
@@ -233,6 +239,10 @@ class AuthorIdentityRepository:
                 author = await self._get_active_author(
                     session=session, author_id=clean_author_id
                 )
+                if author.identity_revision != expected_identity_revision:
+                    raise InvalidStateTransitionError(
+                        "author identity revision no longer matches the request"
+                    )
                 current_credential = await self._get_active_credential(
                     session=session,
                     author_id=author.id,
