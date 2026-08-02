@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass
 from typing import Annotated, NoReturn
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from pydantic import Field
 
 from hub.db.errors import (
     InvalidStateTransitionError,
@@ -42,6 +43,7 @@ class RegisterAuthorRequest:
 class RotateAuthorKeyRequest:
     public_key_b64: str
     reason: str
+    expected_identity_revision: Annotated[int, Field(strict=True, ge=1)]
 
 
 @dataclass(frozen=True)
@@ -246,6 +248,7 @@ def create_author_router(
             author = await service.rotate_key(
                 author_id=author_id,
                 public_key_b64=request.public_key_b64,
+                expected_identity_revision=request.expected_identity_revision,
                 authenticated_actor_id=actor_id,
                 reason=request.reason,
                 correlation_id=_required_header(

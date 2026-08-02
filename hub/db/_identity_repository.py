@@ -132,6 +132,7 @@ class AuthorIdentityRepository:
         author_id: str,
         public_key_b64: str,
         key_fingerprint: str,
+        expected_identity_revision: int,
         authenticated_actor_id: str,
         reason: str,
         correlation_id: str,
@@ -144,12 +145,21 @@ class AuthorIdentityRepository:
         clean_reason = _required(reason, "reason")
         clean_correlation_id = _required(correlation_id, "correlation_id")
         clean_idempotency_key = _required(idempotency_key, "idempotency_key")
+        if (
+            type(expected_identity_revision) is not int
+            or expected_identity_revision < 1
+        ):
+            raise ValueError("expected_identity_revision must be a positive integer")
 
         try:
             async with self._database.transaction() as session:
                 author = await self._get_active_author(
                     session=session, author_id=clean_author_id
                 )
+                if author.identity_revision != expected_identity_revision:
+                    raise InvalidStateTransitionError(
+                        "author identity revision no longer matches the request"
+                    )
                 current_key = await self._get_active_key(
                     session=session, author_id=author.id
                 )
