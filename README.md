@@ -137,6 +137,15 @@ SHA-256 digest. Key rotation, credential rotation, and revocation preserve
 append-only identity history and invalidate superseded credentials
 immediately.
 
+Signing-key and bearer-credential rotation also require a positive
+`expected_identity_revision` in the JSON body. Callers must use the revision
+returned by registration or the most recent identity mutation. A stale revision
+returns `409` before any key, credential, or audit record is created, so
+overlapping rotations based on the same identity snapshot have exactly one
+winner. Author revocation intentionally has no revision precondition: it is an
+unconditional safety action that must remain available after intervening
+identity changes.
+
 An author bearer credential is reusable until it expires or is revoked. It is
 not a per-request nonce, so deployments must expose these endpoints over HTTPS.
 Identity mutation idempotency keys are single-use per authenticated admin

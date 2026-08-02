@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass
 from typing import Annotated, NoReturn
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from pydantic import Field
 
 from hub.db.errors import (
     InvalidStateTransitionError,
@@ -42,6 +43,13 @@ class RegisterAuthorRequest:
 class RotateAuthorKeyRequest:
     public_key_b64: str
     reason: str
+    expected_identity_revision: Annotated[int, Field(strict=True, ge=1)]
+
+
+@dataclass(frozen=True)
+class RotateAuthorCredentialRequest:
+    reason: str
+    expected_identity_revision: Annotated[int, Field(strict=True, ge=1)]
 
 
 @dataclass(frozen=True)
@@ -246,6 +254,7 @@ def create_author_router(
             author = await service.rotate_key(
                 author_id=author_id,
                 public_key_b64=request.public_key_b64,
+                expected_identity_revision=request.expected_identity_revision,
                 authenticated_actor_id=actor_id,
                 reason=request.reason,
                 correlation_id=_required_header(
@@ -267,7 +276,7 @@ def create_author_router(
     @router.post("/{author_id}/credentials/rotate")
     async def rotate_author_credential(
         author_id: str,
-        request: AuthorLifecycleRequest,
+        request: RotateAuthorCredentialRequest,
         response: Response,
         actor_id: str = Depends(require_admin),
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
@@ -277,6 +286,7 @@ def create_author_router(
         try:
             registration = await service.rotate_credential(
                 author_id=author_id,
+                expected_identity_revision=request.expected_identity_revision,
                 authenticated_actor_id=actor_id,
                 reason=request.reason,
                 correlation_id=_required_header(

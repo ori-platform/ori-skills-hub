@@ -246,6 +246,7 @@ def test_credential_rotation_revokes_old_token_and_is_fully_audited(
             initial = await _register(service)
             rotated = await service.rotate_credential(
                 author_id=initial.author.author_id,
+                expected_identity_revision=initial.author.identity_revision,
                 authenticated_actor_id=_ADMIN_ACTOR,
                 reason="scheduled credential rotation",
                 correlation_id="rotate-credential:1",
@@ -290,6 +291,7 @@ def test_credential_rotation_replay_rolls_back_without_replacing_valid_token(
             initial = await _register(service)
             rotated = await service.rotate_credential(
                 author_id=initial.author.author_id,
+                expected_identity_revision=initial.author.identity_revision,
                 authenticated_actor_id=_ADMIN_ACTOR,
                 reason="scheduled credential rotation",
                 correlation_id="rotate-credential:replay",
@@ -299,6 +301,7 @@ def test_credential_rotation_replay_rolls_back_without_replacing_valid_token(
             with pytest.raises(PersistenceConflictError):
                 await service.rotate_credential(
                     author_id=initial.author.author_id,
+                    expected_identity_revision=rotated.author.identity_revision,
                     authenticated_actor_id=_ADMIN_ACTOR,
                     reason="replayed credential rotation",
                     correlation_id="rotate-credential:replay",
@@ -331,6 +334,56 @@ def test_credential_rotation_replay_rolls_back_without_replacing_valid_token(
     _run(scenario())
 
 
+def test_stale_credential_rotation_preserves_newer_token_and_history(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        database, repository, service, _clock = await _setup(tmp_path)
+        try:
+            initial = await _register(service)
+            rotated = await service.rotate_credential(
+                author_id=initial.author.author_id,
+                expected_identity_revision=initial.author.identity_revision,
+                authenticated_actor_id=_ADMIN_ACTOR,
+                reason="first credential rotation",
+                correlation_id="rotate-credential:first",
+                idempotency_key="rotate-credential:first",
+            )
+            with pytest.raises(
+                InvalidStateTransitionError, match="revision no longer matches"
+            ):
+                await service.rotate_credential(
+                    author_id=initial.author.author_id,
+                    expected_identity_revision=initial.author.identity_revision,
+                    authenticated_actor_id=_ADMIN_ACTOR,
+                    reason="stale credential rotation",
+                    correlation_id="rotate-credential:stale",
+                    idempotency_key="rotate-credential:stale",
+                )
+
+            authenticated = await service.authenticate(rotated.credential.bearer_token)
+            credentials = await repository.get_credentials(
+                author_id=initial.author.author_id
+            )
+            history = await repository.get_identity_history(
+                author_id=initial.author.author_id
+            )
+            assert authenticated.credential_id == next(
+                credential.id
+                for credential in credentials
+                if credential.status == "active"
+            )
+            assert len(credentials) == 2
+            assert [entry.event_type for entry in history] == [
+                "registered",
+                "credential_rotated",
+            ]
+        finally:
+            await database.dispose()
+
+    _run(scenario())
+
+
 def test_key_rotation_retains_revoked_key_and_updates_auth_context(
     tmp_path: Path,
 ) -> None:
@@ -341,6 +394,7 @@ def test_key_rotation_retains_revoked_key_and_updates_auth_context(
             rotated = await service.rotate_key(
                 author_id=registration.author.author_id,
                 public_key_b64=_KEY_TWO,
+                expected_identity_revision=registration.author.identity_revision,
                 authenticated_actor_id=_ADMIN_ACTOR,
                 reason="author proved possession of replacement key",
                 correlation_id="rotate-key:1",
@@ -375,6 +429,7 @@ def test_key_rotation_retains_revoked_key_and_updates_auth_context(
                 await service.rotate_key(
                     author_id=registration.author.author_id,
                     public_key_b64=_KEY_ONE,
+                    expected_identity_revision=rotated.identity_revision,
                     authenticated_actor_id=_ADMIN_ACTOR,
                     reason="attempt key reuse",
                     correlation_id="rotate-key:reuse",
@@ -407,6 +462,7 @@ def test_author_revocation_invalidates_token_key_and_future_mutations(
             with pytest.raises(InvalidStateTransitionError, match="revoked"):
                 await service.rotate_credential(
                     author_id=registration.author.author_id,
+                    expected_identity_revision=registration.author.identity_revision,
                     authenticated_actor_id=_ADMIN_ACTOR,
                     reason="must fail",
                     correlation_id="rotate-after-revoke",
@@ -424,6 +480,136 @@ def test_author_revocation_invalidates_token_key_and_future_mutations(
             assert keys[-1].status == "revoked"
             assert credentials[-1].status == "revoked"
             assert history[-1].event_type == "author_revoked"
+        finally:
+            await database.dispose()
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("expected_revision", [0, -1, True])
+def test_key_rotation_rejects_invalid_expected_revision_without_partial_history(
+    tmp_path: Path, expected_revision: int
+) -> None:
+    async def scenario() -> None:
+        database, repository, service, _clock = await _setup(tmp_path)
+        try:
+            registration = await _register(service)
+            with pytest.raises(InvalidAuthorIdentityError, match="positive integer"):
+                await service.rotate_key(
+                    author_id=registration.author.author_id,
+                    public_key_b64=_KEY_TWO,
+                    expected_identity_revision=expected_revision,
+                    authenticated_actor_id=_ADMIN_ACTOR,
+                    reason="invalid optimistic concurrency precondition",
+                    correlation_id="rotate-key:invalid-revision",
+                    idempotency_key=f"rotate-key:invalid-revision:{expected_revision}",
+                )
+            assert (
+                len(
+                    await repository.get_key_history(
+                        author_id=registration.author.author_id
+                    )
+                )
+                == 1
+            )
+            assert (
+                len(
+                    await repository.get_identity_history(
+                        author_id=registration.author.author_id
+                    )
+                )
+                == 1
+            )
+        finally:
+            await database.dispose()
+
+    _run(scenario())
+
+
+def test_stale_key_rotation_rejects_without_partial_history(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database, repository, service, _clock = await _setup(tmp_path)
+        try:
+            registration = await _register(service)
+            rotated = await service.rotate_key(
+                author_id=registration.author.author_id,
+                public_key_b64=_KEY_TWO,
+                expected_identity_revision=1,
+                authenticated_actor_id=_ADMIN_ACTOR,
+                reason="first key rotation",
+                correlation_id="rotate-key:first",
+                idempotency_key="rotate-key:first",
+            )
+            with pytest.raises(
+                InvalidStateTransitionError, match="revision no longer matches"
+            ):
+                await service.rotate_key(
+                    author_id=registration.author.author_id,
+                    public_key_b64=_KEY_THREE,
+                    expected_identity_revision=1,
+                    authenticated_actor_id=_ADMIN_ACTOR,
+                    reason="stale key rotation",
+                    correlation_id="rotate-key:stale",
+                    idempotency_key="rotate-key:stale",
+                )
+            keys = await repository.get_key_history(
+                author_id=registration.author.author_id
+            )
+            history = await repository.get_identity_history(
+                author_id=registration.author.author_id
+            )
+            assert rotated.identity_revision == 2
+            assert len(keys) == 2
+            assert [entry.event_type for entry in history] == [
+                "registered",
+                "key_rotated",
+            ]
+        finally:
+            await database.dispose()
+
+    _run(scenario())
+
+
+def test_sequential_key_rotation_accepts_latest_returned_revision(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        database, repository, service, _clock = await _setup(tmp_path)
+        try:
+            registration = await _register(service)
+            first = await service.rotate_key(
+                author_id=registration.author.author_id,
+                public_key_b64=_KEY_TWO,
+                expected_identity_revision=registration.author.identity_revision,
+                authenticated_actor_id=_ADMIN_ACTOR,
+                reason="first scheduled rotation",
+                correlation_id="rotate-key:sequential:first",
+                idempotency_key="rotate-key:sequential:first",
+            )
+            second = await service.rotate_key(
+                author_id=registration.author.author_id,
+                public_key_b64=_KEY_THREE,
+                expected_identity_revision=first.identity_revision,
+                authenticated_actor_id=_ADMIN_ACTOR,
+                reason="second scheduled rotation",
+                correlation_id="rotate-key:sequential:second",
+                idempotency_key="rotate-key:sequential:second",
+            )
+            keys = await repository.get_key_history(
+                author_id=registration.author.author_id
+            )
+            history = await repository.get_identity_history(
+                author_id=registration.author.author_id
+            )
+            assert second.identity_revision == 3
+            assert second.public_key_b64 == _KEY_THREE
+            assert [key.status for key in keys].count("active") == 1
+            assert len(keys) == 3
+            assert [entry.event_type for entry in history] == [
+                "registered",
+                "key_rotated",
+                "key_rotated",
+            ]
         finally:
             await database.dispose()
 
@@ -477,6 +663,7 @@ def test_concurrent_key_rotation_has_one_winner_and_no_partial_history(
                 return await service.rotate_key(
                     author_id=registration.author.author_id,
                     public_key_b64=key,
+                    expected_identity_revision=registration.author.identity_revision,
                     authenticated_actor_id=_ADMIN_ACTOR,
                     reason=f"concurrent rotation {suffix}",
                     correlation_id=f"rotate-key:{suffix}",
@@ -528,6 +715,7 @@ def test_concurrent_credential_rotation_has_one_winner_and_no_partial_history(
             async def rotate(suffix: str) -> AuthorRegistration:
                 return await service.rotate_credential(
                     author_id=registration.author.author_id,
+                    expected_identity_revision=registration.author.identity_revision,
                     authenticated_actor_id=_ADMIN_ACTOR,
                     reason=f"concurrent credential rotation {suffix}",
                     correlation_id=f"rotate-credential:{suffix}",
@@ -1085,21 +1273,67 @@ def test_admin_endpoints_complete_rotation_and_revocation_lifecycle(
                 author_id = registered.json()["author"]["author_id"]
                 initial_token = registered.json()["credential"]["bearer_token"]
 
+                for suffix, revision_payload in (
+                    ("missing", {}),
+                    ("zero", {"expected_identity_revision": 0}),
+                    ("boolean", {"expected_identity_revision": True}),
+                ):
+                    invalid_rotation = await client.post(
+                        f"/api/authors/{author_id}/keys/rotate",
+                        headers=_admin_headers(f"api-key-rotate-{suffix}"),
+                        json={
+                            "public_key_b64": _KEY_TWO,
+                            "reason": "invalid revision precondition",
+                            **revision_payload,
+                        },
+                    )
+                    assert invalid_rotation.status_code == 422
+
                 key_rotated = await client.post(
                     f"/api/authors/{author_id}/keys/rotate",
                     headers=_admin_headers("api-key-rotate"),
                     json={
                         "public_key_b64": _KEY_TWO,
                         "reason": "scheduled signing-key rotation",
+                        "expected_identity_revision": 1,
                     },
                 )
                 assert key_rotated.status_code == 200
                 assert key_rotated.json()["author"]["public_key_b64"] == _KEY_TWO
 
+                stale_key_rotation = await client.post(
+                    f"/api/authors/{author_id}/keys/rotate",
+                    headers=_admin_headers("api-key-rotate-stale"),
+                    json={
+                        "public_key_b64": _KEY_THREE,
+                        "reason": "stale signing-key rotation",
+                        "expected_identity_revision": 1,
+                    },
+                )
+                assert stale_key_rotation.status_code == 409
+
+                for suffix, revision_payload in (
+                    ("missing", {}),
+                    ("zero", {"expected_identity_revision": 0}),
+                    ("boolean", {"expected_identity_revision": True}),
+                ):
+                    invalid_credential_rotation = await client.post(
+                        f"/api/authors/{author_id}/credentials/rotate",
+                        headers=_admin_headers(f"api-credential-rotate-{suffix}"),
+                        json={
+                            "reason": "invalid revision precondition",
+                            **revision_payload,
+                        },
+                    )
+                    assert invalid_credential_rotation.status_code == 422
+
                 credential_rotated = await client.post(
                     f"/api/authors/{author_id}/credentials/rotate",
                     headers=_admin_headers("api-credential-rotate"),
-                    json={"reason": "scheduled bearer rotation"},
+                    json={
+                        "reason": "scheduled bearer rotation",
+                        "expected_identity_revision": 2,
+                    },
                 )
                 assert credential_rotated.status_code == 200
                 assert credential_rotated.headers["cache-control"] == "no-store"

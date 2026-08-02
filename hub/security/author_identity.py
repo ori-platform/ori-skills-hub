@@ -131,6 +131,14 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+def _identity_revision(value: int) -> int:
+    if type(value) is not int or value < 1:
+        raise InvalidAuthorIdentityError(
+            "expected_identity_revision must be a positive integer"
+        )
+    return value
+
+
 def _issue_token(now: datetime, *, ttl_seconds: int) -> tuple[str, str, str, datetime]:
     lookup_id = secrets.token_urlsafe(_LOOKUP_BYTES)
     secret = secrets.token_urlsafe(_SECRET_BYTES)
@@ -246,6 +254,7 @@ class AuthorIdentityService:
         *,
         author_id: str,
         public_key_b64: str,
+        expected_identity_revision: int,
         authenticated_actor_id: str,
         reason: str,
         correlation_id: str,
@@ -260,6 +269,7 @@ class AuthorIdentityService:
             ),
             public_key_b64=clean_key,
             key_fingerprint=fingerprint,
+            expected_identity_revision=_identity_revision(expected_identity_revision),
             authenticated_actor_id=_clean_text(
                 authenticated_actor_id,
                 field_name="authenticated_actor_id",
@@ -283,6 +293,7 @@ class AuthorIdentityService:
         self,
         *,
         author_id: str,
+        expected_identity_revision: int,
         authenticated_actor_id: str,
         reason: str,
         correlation_id: str,
@@ -303,6 +314,7 @@ class AuthorIdentityService:
             credential_lookup_id=lookup_id,
             credential_hash=credential_hash,
             credential_expires_at=expires_at,
+            expected_identity_revision=_identity_revision(expected_identity_revision),
             authenticated_actor_id=_clean_text(
                 authenticated_actor_id,
                 field_name="authenticated_actor_id",
