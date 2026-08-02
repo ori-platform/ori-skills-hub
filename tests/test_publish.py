@@ -485,6 +485,72 @@ def test_concurrent_publishes_have_exactly_one_winner(tmp_path: Path) -> None:
     _run(scenario())
 
 
+def test_concurrent_distinct_publishes_leave_one_adoptable_orphan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        harness = await _setup(tmp_path)
+        original_exists = harness.repository.skill_version_exists
+        both_preflight_checks_started = asyncio.Event()
+        preflight_check_count = 0
+
+        async def synchronised_exists(*, name: str, version: str) -> bool:
+            nonlocal preflight_check_count
+            preflight_check_count += 1
+            if preflight_check_count == 2:
+                both_preflight_checks_started.set()
+            await asyncio.wait_for(both_preflight_checks_started.wait(), timeout=5)
+            return await original_exists(name=name, version=version)
+
+        monkeypatch.setattr(
+            harness.repository,
+            "skill_version_exists",
+            synchronised_exists,
+        )
+        try:
+            first_upload = _tarball(_MANIFEST_YAML)
+            second_upload = _tarball(_MANIFEST_YAML.replace(b"value > 1", b"value > 2"))
+            assert first_upload != second_upload
+
+            outcomes = await asyncio.gather(
+                harness.publish(first_upload, idempotency_key="distinct-race-1"),
+                harness.publish(second_upload, idempotency_key="distinct-race-2"),
+                return_exceptions=True,
+            )
+            winners = [
+                outcome for outcome in outcomes if isinstance(outcome, PublishResult)
+            ]
+            conflicts = [
+                outcome
+                for outcome in outcomes
+                if isinstance(outcome, PublishConflictError)
+            ]
+            assert len(winners) == 1
+            assert len(conflicts) == 1
+
+            history = await harness.repository.get_transition_history(
+                name="energy", version="1.0.0"
+            )
+            assert len(history) == 1
+            assert history[0].artifact_digest == winners[0].artifact_digest
+
+            stored_digests = {
+                f"sha256:{path.name}"
+                for path in harness.storage.objects_dir.iterdir()
+                if not path.name.startswith(".")
+            }
+            assert len(stored_digests) == 2
+            assert winners[0].artifact_digest in stored_digests
+            orphan_digests = stored_digests - {winners[0].artifact_digest}
+            assert len(orphan_digests) == 1
+            harness.storage.read(orphan_digests.pop())
+        finally:
+            await harness.database.dispose()
+
+    _run(scenario())
+
+
 def test_signature_profiles_are_not_interchanged(tmp_path: Path) -> None:
     async def scenario() -> None:
         harness = await _setup(tmp_path)
