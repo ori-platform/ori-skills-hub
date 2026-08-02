@@ -132,6 +132,8 @@ def test_bootstrap_is_idempotent(tmp_path: Path) -> None:
         "author_identity_audit",
         "author_keys",
         "authors",
+        "scan_events",
+        "scan_jobs",
         "skill_transition_audit",
         "skill_versions",
     }
@@ -163,7 +165,7 @@ def test_alembic_upgrade_is_repeatable(
                 "SELECT name FROM sqlite_master WHERE type = 'trigger'"
             )
         }
-    assert revision == ("7a2b9c4d1e05",)
+    assert revision == ("c4d2a8f19b73",)
     assert "skill_transition_audit" in tables
     assert triggers == {
         "artifacts_reject_delete",
@@ -196,6 +198,14 @@ def test_alembic_upgrade_is_repeatable(
         "authors_validate_identity_revision",
         "authors_validate_key_rotation",
         "authors_validate_status_transition",
+        "scan_events_reject_delete",
+        "scan_events_reject_update",
+        "scan_jobs_validate_initial_state",
+        "scan_jobs_validate_state_evidence",
+        "scan_jobs_validate_state_transition",
+        "scan_jobs_reject_terminal_rewrite",
+        "scan_jobs_reject_delete",
+        "skill_transition_audit_require_scan_evidence",
         "skill_transition_audit_reject_delete",
         "skill_transition_audit_reject_update",
         "skill_transition_audit_apply_listing",
@@ -204,6 +214,8 @@ def test_alembic_upgrade_is_repeatable(
         "skill_transition_audit_validate_timestamp",
         "skill_versions_reject_approval_update",
         "skill_versions_reject_identity_authority_update",
+        "skill_versions_reject_scan_requirement_update",
+        "skill_versions_require_scan_job",
         "skill_versions_require_transition_audit",
         "skill_versions_validate_initial_status",
         "skill_versions_validate_revision_transition",

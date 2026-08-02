@@ -19,6 +19,7 @@ def test_load_from_env_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("HUB_AUTHOR_REGISTRATION_ENABLED", raising=False)
     monkeypatch.delenv("HUB_AUTHOR_TOKEN_TTL_SECONDS", raising=False)
     monkeypatch.delenv("HUB_PUBLISH_ENABLED", raising=False)
+    monkeypatch.delenv("HUB_SCAN_WORKER_ENABLED", raising=False)
 
     cfg = load_from_env()
 
@@ -27,6 +28,10 @@ def test_load_from_env_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg.author_registration_enabled is False
     assert cfg.author_token_ttl_seconds == 2_592_000
     assert cfg.publish_enabled is False
+    assert cfg.scan_worker_enabled is True
+    assert cfg.scan_lease_seconds == 30
+    assert cfg.scan_max_attempts == 20
+    assert cfg.scan_max_age_seconds == 86_400
     assert cfg.admin_api_key not in repr(cfg)
 
 
@@ -38,6 +43,13 @@ def test_load_from_env_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
         ("HUB_AUTHOR_TOKEN_TTL_SECONDS", "299"),
         ("HUB_AUTHOR_TOKEN_TTL_SECONDS", "7776001"),
         ("HUB_PUBLISH_ENABLED", "sometimes"),
+        ("HUB_SCAN_WORKER_ENABLED", "sometimes"),
+        ("HUB_SCAN_LEASE_SECONDS", "0"),
+        ("HUB_SCAN_MAX_ATTEMPTS", "1001"),
+        ("HUB_SCAN_MAX_AGE_SECONDS", "59"),
+        ("HUB_SCAN_INITIAL_BACKOFF_SECONDS", "301"),
+        ("HUB_SCAN_MAX_BACKOFF_SECONDS", "0"),
+        ("HUB_SCAN_JITTER_SECONDS", "301"),
     ],
 )
 def test_load_from_env_rejects_invalid_author_identity_config(
@@ -58,6 +70,18 @@ def test_load_from_env_rejects_weak_admin_key(
     monkeypatch.setenv("HUB_ADMIN_API_KEY", "secret")
 
     with pytest.raises(ConfigError):
+        load_from_env()
+
+
+def test_publish_mode_rejects_disabled_local_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HUB_ADMIN_API_KEY", "a" * 32)
+    monkeypatch.setenv("HUB_PUBLISH_ENABLED", "true")
+    monkeypatch.setenv("HUB_VIRUSTOTAL_API_KEY", "configured-provider-key")
+    monkeypatch.setenv("HUB_SCAN_WORKER_ENABLED", "false")
+
+    with pytest.raises(ConfigError, match="external worker mode"):
         load_from_env()
 
 

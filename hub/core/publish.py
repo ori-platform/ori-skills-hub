@@ -20,11 +20,12 @@ from hub.core.errors import (
     PublishConflictError,
     PublishReplayError,
 )
-from hub.core.models import PublishResult, ScannerVerdict, SkillStatus
+from hub.core.models import PublishResult, ScanJobState, ScannerVerdict, SkillStatus
 from hub.core.review import publish_decision
 from hub.core.validation import validate_skill_metadata
+from hub.db._models import new_record_id
 from hub.db.errors import PersistenceConflictError
-from hub.db.repository import HubRepository
+from hub.db.repository import HubRepository, NewScanJob
 from hub.integrations.scan import ScanResult
 from hub.security.author_identity import AuthenticatedAuthor
 from hub.security.hub_keys import HubSigningKeys
@@ -97,6 +98,7 @@ async def publish_skill(
     idempotency_key: str,
     tarball_limits: TarballLimits = DEFAULT_TARBALL_LIMITS,
     scanner_timeout_seconds: float = SCANNER_TIMEOUT_SECONDS,
+    defer_scan: bool = False,
 ) -> PublishResult:
     """Run the publish pipeline for one author-signed upload.
 
@@ -128,16 +130,21 @@ async def publish_skill(
         raise PublishConflictError("skill name and version are already published")
 
     decision = publish_decision(manifest)
-    verdict, detail = await _scan_with_timeout(
-        scanner,
-        upload_bytes,
-        timeout_seconds=scanner_timeout_seconds,
-    )
-    initial_status = (
-        SkillStatus.LISTED
-        if decision.status is SkillStatus.LISTED and verdict is ScannerVerdict.CLEAN
-        else SkillStatus.PENDING_REVIEW
-    )
+    if defer_scan:
+        verdict = ScannerVerdict.UNAVAILABLE
+        detail = "asynchronous scan pending"
+        initial_status = SkillStatus.PENDING_REVIEW
+    else:
+        verdict, detail = await _scan_with_timeout(
+            scanner,
+            upload_bytes,
+            timeout_seconds=scanner_timeout_seconds,
+        )
+        initial_status = (
+            SkillStatus.LISTED
+            if decision.status is SkillStatus.LISTED and verdict is ScannerVerdict.CLEAN
+            else SkillStatus.PENDING_REVIEW
+        )
 
     manifest_signature = signing_keys.sign_manifest(manifest)
     signed_manifest: dict[str, object] = {
@@ -153,12 +160,14 @@ async def publish_skill(
         final_bytes, artifact_metadata, anchors.artifact_public_key_b64
     )
 
+    author_upload_storage_key = storage.store(upload_bytes) if defer_scan else None
     artifact_digest = storage.store(final_bytes)
     manifest_digest = (
         "sha256:"
         + hashlib.sha256(canonical_manifest_bytes(signed_manifest)).hexdigest()
     )
 
+    scan_job_id = new_record_id() if defer_scan else None
     try:
         skill = await repository.create_publication(
             name=validation.name,
@@ -179,6 +188,17 @@ async def publish_skill(
             reason=reason,
             correlation_id=correlation_id,
             idempotency_key=idempotency_key,
+            scan_job=(
+                NewScanJob(
+                    job_id=scan_job_id,
+                    author_upload_digest=author_metadata["artifact_sha256"],
+                    author_upload_storage_key=author_upload_storage_key,
+                    correlation_id=correlation_id,
+                    idempotency_key=idempotency_key,
+                )
+                if scan_job_id is not None and author_upload_storage_key is not None
+                else None
+            ),
         )
     except PersistenceConflictError as exc:
         raise PublishConflictError(
@@ -191,4 +211,6 @@ async def publish_skill(
         status=SkillStatus(skill.status),
         artifact_digest=artifact_digest,
         manifest_digest=manifest_digest,
+        scan_job_id=scan_job_id,
+        scanner_state=(ScanJobState.PENDING_SUBMISSION if defer_scan else None),
     )

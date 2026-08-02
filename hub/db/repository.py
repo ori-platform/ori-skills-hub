@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import NoReturn
 
-from sqlalchemy import Select, insert, literal, select, update
+from sqlalchemy import Select, insert, literal, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,6 +18,8 @@ from hub.core.models import ScannerVerdict, SkillStatus
 from hub.db._models import (
     ArtifactModel,
     AuthorModel,
+    ScanEventModel,
+    ScanJobModel,
     SkillTransitionAuditModel,
     SkillVersionModel,
     new_record_id,
@@ -62,6 +64,18 @@ class PendingSkillReview:
     scanner_verdict: str
     scanner_detail: str
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class NewScanJob:
+    """Verified author upload admitted for asynchronous scanning."""
+
+    job_id: str
+    author_upload_digest: str
+    author_upload_storage_key: str
+    correlation_id: str
+    idempotency_key: str
+    provider: str = "virustotal"
 
 
 def _required(value: str, field_name: str) -> str:
@@ -129,6 +143,7 @@ class HubRepository:
         reason: str,
         correlation_id: str,
         idempotency_key: str,
+        scan_job: NewScanJob | None = None,
     ) -> SkillVersionModel:
         if initial_status not in {
             SkillStatus.PENDING_REVIEW,
@@ -141,6 +156,15 @@ class HubRepository:
             raise InvalidStateTransitionError(
                 "Tier C/D skills must enter pending review before listing"
             )
+        if scan_job is not None and initial_status is not SkillStatus.PENDING_REVIEW:
+            raise InvalidStateTransitionError(
+                "scan-required publications must start pending review"
+            )
+        if (
+            scan_job is not None
+            and scan_job.author_upload_storage_key != scan_job.author_upload_digest
+        ):
+            raise ValueError("author upload storage key must equal its content digest")
         if byte_size < 0:
             raise ValueError("byte_size must not be negative")
         if len(scanner_detail) > 1024:
@@ -174,6 +198,7 @@ class HubRepository:
             artifact_id=artifact.id,
             status=initial_status.value,
             declares_tier_cd=declares_tier_cd,
+            requires_scan=scan_job is not None,
         )
         audit = SkillTransitionAuditModel(
             id=new_record_id(),
@@ -193,6 +218,44 @@ class HubRepository:
             async with self._database.transaction() as session:
                 session.add(artifact)
                 await session.flush()
+                if scan_job is not None:
+                    job = ScanJobModel(
+                        id=_required(scan_job.job_id, "scan job_id"),
+                        artifact_id=artifact.id,
+                        provider=_required(scan_job.provider, "scan provider"),
+                        state="pending_submission",
+                        attempt_count=0,
+                        detail="awaiting provider submission",
+                        stats_json="{}",
+                        correlation_id=_required(
+                            scan_job.correlation_id, "scan correlation_id"
+                        ),
+                        idempotency_key=_required(
+                            scan_job.idempotency_key, "scan idempotency_key"
+                        ),
+                        author_upload_digest=_digest(
+                            scan_job.author_upload_digest, "author_upload_digest"
+                        ),
+                        author_upload_storage_key=_required(
+                            scan_job.author_upload_storage_key,
+                            "author_upload_storage_key",
+                        ),
+                    )
+                    session.add(job)
+                    await session.flush()
+                    session.add(
+                        ScanEventModel(
+                            id=new_record_id(),
+                            scan_job_id=job.id,
+                            state=job.state,
+                            attempt_count=0,
+                            verdict=None,
+                            detail=job.detail,
+                            stats_json="{}",
+                            worker_id=None,
+                        )
+                    )
+                    await session.flush()
                 session.add(audit)
                 await session.flush()
                 session.add(skill)
@@ -336,10 +399,17 @@ class HubRepository:
             raise ValueError("limit must be between 1 and 100")
         async with self._database.transaction() as session:
             result = await session.execute(
-                select(SkillVersionModel, AuthorModel, ArtifactModel)
+                select(SkillVersionModel, AuthorModel, ArtifactModel, ScanJobModel)
                 .join(AuthorModel, AuthorModel.id == SkillVersionModel.author_id)
                 .join(ArtifactModel, ArtifactModel.id == SkillVersionModel.artifact_id)
-                .where(SkillVersionModel.status == SkillStatus.PENDING_REVIEW.value)
+                .outerjoin(ScanJobModel, ScanJobModel.artifact_id == ArtifactModel.id)
+                .where(
+                    SkillVersionModel.status == SkillStatus.PENDING_REVIEW.value,
+                    or_(
+                        ScanJobModel.id.is_(None),
+                        ScanJobModel.state.in_(("clean", "manual_review", "exhausted")),
+                    ),
+                )
                 .order_by(SkillVersionModel.created_at, SkillVersionModel.id)
                 .limit(limit)
             )
@@ -349,11 +419,19 @@ class HubRepository:
                     version=skill.version,
                     author=author.display_handle,
                     declares_tier_cd=skill.declares_tier_cd,
-                    scanner_verdict=artifact.scanner_verdict,
-                    scanner_detail=artifact.scanner_detail,
+                    scanner_verdict=(
+                        scan_job.verdict
+                        if scan_job is not None and scan_job.verdict is not None
+                        else artifact.scanner_verdict
+                    ),
+                    scanner_detail=(
+                        scan_job.detail
+                        if scan_job is not None
+                        else artifact.scanner_detail
+                    ),
                     created_at=skill.created_at,
                 )
-                for skill, author, artifact in result.tuples().all()
+                for skill, author, artifact, scan_job in result.tuples().all()
             ]
 
     async def list_listed_versions(self, *, name: str) -> list[PublicSkillVersion]:

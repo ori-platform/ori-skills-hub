@@ -20,6 +20,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hub.db.repository import HubRepository
+from hub.db.scans import ScanRepository
 from hub.db.session import Database
 from hub.integrations.scan import ScanResult
 from hub.security.author_identity import AuthorIdentityService
@@ -103,6 +104,11 @@ class _CleanScanner:
         return ScanResult(status="clean", detail="scanner clean")
 
 
+class _MustNotScanInline:
+    def scan(self, _payload: bytes) -> ScanResult:
+        pytest.fail("publish request waited for inline malware scanning")
+
+
 class _Fixture:
     def __init__(self, tmp_path: Path) -> None:
         self.database = Database(f"sqlite:///{tmp_path / 'hub.db'}")
@@ -175,6 +181,61 @@ def test_publish_happy_path_returns_201_without_signature_values(
     assert payload["artifact_digest"].startswith("sha256:")
     assert payload["manifest_digest"].startswith("sha256:")
     assert "signature" not in payload
+
+
+def test_async_publish_returns_202_with_durable_nonpublic_scan_job(
+    fixture: Any,
+) -> None:
+    scans = ScanRepository(fixture.database)
+    app = create_app(
+        author_identity_service=fixture.identity_service,
+        admin_api_key=_ADMIN_API_KEY,
+        skill_repository=fixture.repository,
+        artifact_storage=fixture.storage,
+        hub_signing_keys=_signing_keys(),
+        scanner=_MustNotScanInline(),
+        scan_repository=scans,
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/skills", content=fixture.upload, headers=fixture.headers()
+    )
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["status"] == "pending_review"
+    assert payload["scanner_state"] == "pending_submission"
+    assert payload["scan_status_url"] == (f"/api/skills/scans/{payload['scan_job_id']}")
+    assert client.get("/api/skills").json() == {"skills": []}
+    replay = client.post(
+        "/api/skills", content=fixture.upload, headers=fixture.headers()
+    )
+    assert replay.status_code == 409
+
+    status_response = client.get(
+        payload["scan_status_url"],
+        headers={"Authorization": f"Bearer {fixture.bearer_token}"},
+    )
+    assert status_response.status_code == 200
+    assert status_response.json()["state"] == "pending_submission"
+    assert "analysis" not in status_response.text
+    assert _ADMIN_API_KEY not in status_response.text
+
+    metrics_response = client.get(
+        "/api/admin/skills/scan-metrics",
+        headers={"Authorization": f"Bearer {_ADMIN_API_KEY}"},
+    )
+    assert metrics_response.status_code == 200
+    assert metrics_response.json()["queue_depth"] == 1
+    assert metrics_response.json()["worker"]["exhausted"] == 0
+    assert metrics_response.headers["cache-control"] == "no-store"
+    assert (
+        "202"
+        in client.get("/openapi.json").json()["paths"]["/api/skills"]["post"][
+            "responses"
+        ]
+    )
 
 
 def test_publish_requires_author_bearer(fixture: Any) -> None:

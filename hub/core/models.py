@@ -24,6 +24,18 @@ class ScannerVerdict(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
+class ScanJobState(StrEnum):
+    """Durable asynchronous malware-scan lifecycle."""
+
+    PENDING_SUBMISSION = "pending_submission"
+    SUBMITTED = "submitted"
+    POLLING = "polling"
+    CLEAN = "clean"
+    MALICIOUS = "malicious"
+    MANUAL_REVIEW = "manual_review"
+    EXHAUSTED = "exhausted"
+
+
 @dataclass(frozen=True)
 class SkillRecord:
     name: str
@@ -52,3 +64,5 @@ class PublishResult:
     status: SkillStatus
     artifact_digest: str
     manifest_digest: str
+    scan_job_id: str | None = None
+    scanner_state: ScanJobState | None = None

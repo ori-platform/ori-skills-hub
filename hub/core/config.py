@@ -24,6 +24,13 @@ class HubConfig:
     author_token_ttl_seconds: int
     publish_enabled: bool
     virustotal_api_key: str | None = field(repr=False)
+    scan_worker_enabled: bool
+    scan_lease_seconds: int
+    scan_max_attempts: int
+    scan_max_age_seconds: int
+    scan_initial_backoff_seconds: int
+    scan_max_backoff_seconds: int
+    scan_jitter_seconds: int
 
 
 def _boolean_env(name: str, *, default: bool) -> bool:
@@ -73,6 +80,7 @@ def load_from_env() -> HubConfig:
         default=False,
     )
     publish_enabled = _boolean_env("HUB_PUBLISH_ENABLED", default=False)
+    scan_worker_enabled = _boolean_env("HUB_SCAN_WORKER_ENABLED", default=True)
 
     admin_actor_id = environ.get("HUB_ADMIN_ACTOR_ID", "bootstrap-admin").strip()
     if not admin_actor_id:
@@ -95,6 +103,31 @@ def load_from_env() -> HubConfig:
     virustotal = environ.get("HUB_VIRUSTOTAL_API_KEY", "").strip() or None
     if publish_enabled and virustotal is None:
         raise ConfigError("HUB_PUBLISH_ENABLED requires HUB_VIRUSTOTAL_API_KEY")
+    if publish_enabled and not scan_worker_enabled:
+        raise ConfigError(
+            "HUB_PUBLISH_ENABLED requires HUB_SCAN_WORKER_ENABLED until an "
+            "external worker mode is implemented"
+        )
+    scan_lease_seconds = _integer_env("HUB_SCAN_LEASE_SECONDS", default=30)
+    scan_max_attempts = _integer_env("HUB_SCAN_MAX_ATTEMPTS", default=20)
+    scan_max_age_seconds = _integer_env("HUB_SCAN_MAX_AGE_SECONDS", default=86_400)
+    scan_initial_backoff_seconds = _integer_env(
+        "HUB_SCAN_INITIAL_BACKOFF_SECONDS", default=2
+    )
+    scan_max_backoff_seconds = _integer_env("HUB_SCAN_MAX_BACKOFF_SECONDS", default=300)
+    scan_jitter_seconds = _integer_env("HUB_SCAN_JITTER_SECONDS", default=1)
+    if not 1 <= scan_lease_seconds <= 300:
+        raise ConfigError("HUB_SCAN_LEASE_SECONDS must be between 1 and 300")
+    if not 1 <= scan_max_attempts <= 1000:
+        raise ConfigError("HUB_SCAN_MAX_ATTEMPTS must be between 1 and 1000")
+    if not 60 <= scan_max_age_seconds <= 604_800:
+        raise ConfigError("HUB_SCAN_MAX_AGE_SECONDS must be between 60 and 604800")
+    if not 1 <= scan_initial_backoff_seconds <= scan_max_backoff_seconds:
+        raise ConfigError("HUB scan backoff bounds are invalid")
+    if not scan_max_backoff_seconds <= 3600:
+        raise ConfigError("HUB_SCAN_MAX_BACKOFF_SECONDS must not exceed 3600")
+    if not 0 <= scan_jitter_seconds <= scan_max_backoff_seconds:
+        raise ConfigError("HUB_SCAN_JITTER_SECONDS is outside the backoff bounds")
     return HubConfig(
         env=environ.get("HUB_ENV", "development"),
         database_url=environ.get(
@@ -110,4 +143,11 @@ def load_from_env() -> HubConfig:
         author_token_ttl_seconds=token_ttl_seconds,
         publish_enabled=publish_enabled,
         virustotal_api_key=virustotal,
+        scan_worker_enabled=scan_worker_enabled,
+        scan_lease_seconds=scan_lease_seconds,
+        scan_max_attempts=scan_max_attempts,
+        scan_max_age_seconds=scan_max_age_seconds,
+        scan_initial_backoff_seconds=scan_initial_backoff_seconds,
+        scan_max_backoff_seconds=scan_max_backoff_seconds,
+        scan_jitter_seconds=scan_jitter_seconds,
     )

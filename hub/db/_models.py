@@ -904,6 +904,146 @@ _SQLITE_SCHEMA_GUARDS = (
         END;
     END
     """,
+    """
+    CREATE TRIGGER IF NOT EXISTS scan_events_reject_update
+    BEFORE UPDATE ON scan_events
+    BEGIN
+        SELECT RAISE(ABORT, 'scan events are append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS scan_events_reject_delete
+    BEFORE DELETE ON scan_events
+    BEGIN
+        SELECT RAISE(ABORT, 'scan events are append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS scan_jobs_validate_initial_state
+    BEFORE INSERT ON scan_jobs
+    WHEN NEW.state <> 'pending_submission'
+         OR NEW.attempt_count <> 0
+         OR NEW.provider_analysis_id IS NOT NULL
+         OR NEW.lease_owner IS NOT NULL
+         OR NEW.lease_expires_at IS NOT NULL
+         OR NOT EXISTS (
+             SELECT 1 FROM artifacts
+             WHERE id = NEW.artifact_id
+               AND author_artifact_digest = NEW.author_upload_digest
+         )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid initial scan job state');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS scan_jobs_validate_state_transition
+    BEFORE UPDATE OF state ON scan_jobs
+    WHEN NEW.state <> OLD.state
+         AND NOT (
+             (OLD.state = 'pending_submission'
+              AND NEW.state IN ('submitted', 'manual_review', 'exhausted'))
+             OR (OLD.state IN ('submitted', 'polling')
+                 AND NEW.state IN (
+                     'polling', 'clean', 'malicious', 'manual_review', 'exhausted'
+                 ))
+         )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid scan job state transition');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS scan_jobs_reject_terminal_rewrite
+    BEFORE UPDATE ON scan_jobs
+    WHEN OLD.state IN ('clean', 'malicious', 'manual_review', 'exhausted')
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal scan evidence is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS scan_jobs_reject_delete
+    BEFORE DELETE ON scan_jobs
+    BEGIN
+        SELECT RAISE(ABORT, 'scan jobs and evidence are durable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS scan_jobs_validate_state_evidence
+    BEFORE UPDATE ON scan_jobs
+    WHEN (
+            NEW.state IN ('submitted', 'polling')
+            AND (
+                NEW.provider_analysis_id IS NULL
+                OR NEW.submitted_at IS NULL
+                OR NEW.completed_at IS NOT NULL
+            )
+         )
+         OR (
+            NEW.state IN ('clean', 'malicious')
+            AND (
+                NEW.provider_analysis_id IS NULL
+                OR NEW.completed_at IS NULL
+                OR NEW.verdict <> NEW.state
+                OR NEW.stats_json = '{}'
+            )
+         )
+         OR (
+            NEW.state IN ('manual_review', 'exhausted')
+            AND (NEW.completed_at IS NULL OR NEW.verdict IS NULL)
+         )
+         OR (
+            NEW.state NOT IN ('clean', 'malicious', 'manual_review', 'exhausted')
+            AND NEW.completed_at IS NOT NULL
+         )
+         OR (
+            OLD.provider_analysis_id IS NOT NULL
+            AND NEW.provider_analysis_id IS NOT OLD.provider_analysis_id
+         )
+    BEGIN
+        SELECT RAISE(ABORT, 'scan job state lacks matching bounded evidence');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS skill_versions_require_scan_job
+    BEFORE INSERT ON skill_versions
+    WHEN NEW.requires_scan
+         AND (
+             NEW.status <> 'pending_review'
+             OR NOT EXISTS (
+                 SELECT 1 FROM scan_jobs
+                 WHERE artifact_id = NEW.artifact_id
+                   AND state = 'pending_submission'
+             )
+         )
+    BEGIN
+        SELECT RAISE(ABORT, 'scan-required publication needs a pending scan job');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS skill_versions_reject_scan_requirement_update
+    BEFORE UPDATE OF requires_scan ON skill_versions
+    BEGIN
+        SELECT RAISE(ABORT, 'skill scan requirement is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS skill_transition_audit_require_scan_evidence
+    BEFORE INSERT ON skill_transition_audit
+    WHEN NEW.new_status = 'listed'
+         AND EXISTS (
+             SELECT 1 FROM skill_versions
+             WHERE id = NEW.skill_version_id AND requires_scan
+         )
+         AND NOT EXISTS (
+             SELECT 1
+             FROM skill_versions AS skill
+             JOIN scan_jobs AS job ON job.artifact_id = skill.artifact_id
+             WHERE skill.id = NEW.skill_version_id
+               AND job.state IN ('clean', 'manual_review', 'exhausted')
+         )
+    BEGIN
+        SELECT RAISE(ABORT, 'listing requires persisted scanner evidence');
+    END
+    """,
 )
 
 NAMING_CONVENTION = {
@@ -1291,6 +1431,9 @@ class SkillVersionModel(Base):
     declares_tier_cd: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="0"
     )
+    requires_scan: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
     downloads: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
@@ -1378,6 +1521,101 @@ class SkillTransitionAuditModel(Base):
     manifest_digest: Mapped[str] = mapped_column(String(71), nullable=False)
 
 
+class ScanJobModel(Base):
+    """Mutable durable scanner work item; changes are recorded in scan_events."""
+
+    __tablename__ = "scan_jobs"
+    __table_args__ = (
+        UniqueConstraint("artifact_id", name="one_scan_job_per_artifact"),
+        CheckConstraint(
+            "state IN ('pending_submission', 'submitted', 'polling', 'clean', "
+            "'malicious', 'manual_review', 'exhausted')",
+            name="state_valid",
+        ),
+        CheckConstraint("attempt_count >= 0", name="attempt_count_nonnegative"),
+        CheckConstraint("length(provider) > 0", name="provider_set"),
+        CheckConstraint(
+            "provider_analysis_id IS NULL OR length(provider_analysis_id) <= 512",
+            name="provider_analysis_id_bounded",
+        ),
+        CheckConstraint("length(detail) <= 1024", name="detail_bounded"),
+        CheckConstraint("length(stats_json) <= 4096", name="stats_json_bounded"),
+        CheckConstraint("json_valid(stats_json)", name="stats_json_valid"),
+        CheckConstraint("length(correlation_id) > 0", name="correlation_id_set"),
+        CheckConstraint("length(idempotency_key) > 0", name="idempotency_key_set"),
+        CheckConstraint(
+            "author_upload_digest LIKE 'sha256:%' "
+            "AND length(author_upload_digest) = 71",
+            name="author_upload_digest_valid",
+        ),
+        CheckConstraint("length(author_upload_storage_key) > 0", name="upload_key_set"),
+        Index("ix_scan_jobs_due", "state", "next_attempt_at"),
+        Index("ix_scan_jobs_lease", "lease_expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_record_id)
+    artifact_id: Mapped[str] = mapped_column(
+        ForeignKey("artifacts.id", ondelete="RESTRICT"), nullable=False
+    )
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_analysis_id: Mapped[str | None] = mapped_column(String(512))
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+    lease_owner: Mapped[str | None] = mapped_column(String(255))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_polled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    verdict: Mapped[str | None] = mapped_column(String(32))
+    detail: Mapped[str] = mapped_column(String(1024), nullable=False, default="")
+    stats_json: Mapped[str] = mapped_column(String(4096), nullable=False, default="{}")
+    correlation_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    author_upload_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    author_upload_storage_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+
+
+class ScanEventModel(Base):
+    """Append-only scanner state and evidence history."""
+
+    __tablename__ = "scan_events"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('pending_submission', 'submitted', 'polling', 'clean', "
+            "'malicious', 'manual_review', 'exhausted')",
+            name="state_valid",
+        ),
+        CheckConstraint("attempt_count >= 0", name="attempt_count_nonnegative"),
+        CheckConstraint("length(detail) <= 1024", name="detail_bounded"),
+        CheckConstraint("length(stats_json) <= 4096", name="stats_json_bounded"),
+        CheckConstraint("json_valid(stats_json)", name="stats_json_valid"),
+        Index("ix_scan_events_job_time", "scan_job_id", "occurred_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_record_id)
+    scan_job_id: Mapped[str] = mapped_column(
+        ForeignKey("scan_jobs.id", ondelete="RESTRICT"), nullable=False
+    )
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    verdict: Mapped[str | None] = mapped_column(String(32))
+    detail: Mapped[str] = mapped_column(String(1024), nullable=False)
+    stats_json: Mapped[str] = mapped_column(String(4096), nullable=False)
+    worker_id: Mapped[str | None] = mapped_column(String(255))
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+
+
 def _reject_immutable_change(
     _mapper: Mapper[Any], _connection: Connection, target: object
 ) -> None:
@@ -1409,6 +1647,10 @@ def _validate_initial_skill(
         raise InvalidStateTransitionError(
             "Tier C/D skills cannot be created in the listed state"
         )
+    if target.requires_scan and target.status == SkillStatus.LISTED.value:
+        raise InvalidStateTransitionError(
+            "scan-required skills cannot be created in the listed state"
+        )
 
 
 def _reject_client_audit_timestamp(
@@ -1434,6 +1676,12 @@ def _validate_identity_record_update(
     raise InvalidStateTransitionError(
         "author key and credential transitions must use AuthorIdentityRepository"
     )
+
+
+def _reject_scan_job_update(
+    _mapper: Mapper[Any], _connection: Connection, _target: ScanJobModel
+) -> None:
+    raise InvalidStateTransitionError("scan job transitions must use ScanRepository")
 
 
 def _reject_client_identity_audit_timestamp(
@@ -1466,4 +1714,7 @@ event.listen(
 )
 event.listen(SkillVersionModel, "before_insert", _validate_initial_skill)
 event.listen(SkillVersionModel, "before_update", _reject_skill_update)
+event.listen(ScanJobModel, "before_update", _reject_scan_job_update)
+event.listen(ScanEventModel, "before_update", _reject_immutable_change)
+event.listen(ScanEventModel, "before_delete", _reject_immutable_change)
 event.listen(Base.metadata, "after_create", _install_sqlite_schema_guards)
