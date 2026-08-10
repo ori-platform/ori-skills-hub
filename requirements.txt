@@ -661,7 +661,7 @@ typing-inspection==0.4.2 \
     # via
     #   fastapi
     #   pydantic
-uvicorn==0.35.0 \
-    --hash=sha256:197535216b25ff9b785e29a0b79199f55222193d47f820816e7da751e9bc8d4a \
-    --hash=sha256:bc662f087f7cf2ce11a1d7fd70b90c9f98ef2e2831556dd078d131b96cc94a01
+uvicorn==0.52.1 \
+    --hash=sha256:112ec661814189acbccd3f7b86460147cc065fc92c0821afa78918780e4354dd \
+    --hash=sha256:e4403f9d93188cf9d1088e9f40e3acd12630e2df8675316704379a7fc20fff6a
     # via -r requirements.in
