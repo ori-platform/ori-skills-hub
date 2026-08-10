@@ -68,6 +68,23 @@ def _run(awaitable: Coroutine[Any, Any, _T]) -> _T:
     return asyncio.run(awaitable)
 
 
+def _app_route_paths(app: Any) -> set[str]:
+    """Return route paths across FastAPI's flat and included-router entries."""
+
+    paths: set[str] = set()
+    for route in app.routes:
+        path = getattr(route, "path", None)
+        if isinstance(path, str):
+            paths.add(path)
+            continue
+        original_router = getattr(route, "original_router", None)
+        for nested_route in getattr(original_router, "routes", []):
+            nested_path = getattr(nested_route, "path", None)
+            if isinstance(nested_path, str):
+                paths.add(nested_path)
+    return paths
+
+
 def _admin_headers(operation: str) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {_ADMIN_KEY}",
@@ -1060,7 +1077,7 @@ def test_environment_backed_app_factory_exposes_author_routes(
     )
 
     configured_app = create_configured_app()
-    paths = {route.path for route in configured_app.routes}
+    paths = _app_route_paths(configured_app)
     assert {
         "/api/authors/register",
         "/api/authors/{author_id}/keys/rotate",
@@ -1097,7 +1114,7 @@ def test_configured_publish_app_lifespan_starts_and_disposes_once(
 
     async def scenario() -> None:
         async with configured_app.router.lifespan_context(configured_app):
-            paths = {route.path for route in configured_app.routes}
+            paths = _app_route_paths(configured_app)
             assert {
                 "/api/authors/register",
                 "/api/skills",
