@@ -7,4 +7,10 @@ pip-audit>=2.7
 cyclonedx-bom>=4.0
 # Floor transitive/build tools above pip-audit advisories
 msgpack>=1.2.1
-pip>=26.1.2
+
+# pip is deliberately not listed here. It is the installer, not an application
+# dependency, and `pip-compile` treats it as unsafe-to-pin: any regeneration
+# without --allow-unsafe drops it from the lockfile, which is exactly what
+# Dependabot does on every bump. Listing it here made the alignment check fail
+# on every Dependabot pull request. Its floor is enforced in CI instead, and
+# the installed environment is audited so the advisory is still caught.
