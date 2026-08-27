@@ -35,7 +35,6 @@ dev = [
   "pip-audit>=2.7",
   "cyclonedx-bom>=4.0",
   "msgpack>=1.2.1",
-  "pip>=26.1.2",
 ]
 
 [tool.setuptools.packages.find]
