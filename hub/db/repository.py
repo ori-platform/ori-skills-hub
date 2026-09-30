@@ -392,7 +392,7 @@ class HubRepository:
                 .order_by(SkillVersionModel.name, SkillVersionModel.version.desc())
                 .limit(limit)
             )
-            return self._public_skill_versions(result.tuples().all())
+            return self._public_skill_versions(result.all())
 
     async def list_pending_reviews(self, *, limit: int) -> list[PendingSkillReview]:
         if not 1 <= limit <= 100:
@@ -431,7 +431,7 @@ class HubRepository:
                     ),
                     created_at=skill.created_at,
                 )
-                for skill, author, artifact, scan_job in result.tuples().all()
+                for skill, author, artifact, scan_job in result.all()
             ]
 
     async def list_listed_versions(self, *, name: str) -> list[PublicSkillVersion]:
@@ -442,7 +442,7 @@ class HubRepository:
                 .where(SkillVersionModel.name == clean_name)
                 .order_by(SkillVersionModel.version.desc())
             )
-            return self._public_skill_versions(result.tuples().all())
+            return self._public_skill_versions(result.all())
 
     async def get_listed_skill(self, *, name: str, version: str) -> PublicSkillVersion:
         clean_name = _required(name, "name")
@@ -454,7 +454,7 @@ class HubRepository:
                     SkillVersionModel.version == clean_version,
                 )
             )
-            records = self._public_skill_versions(result.tuples().all())
+            records = self._public_skill_versions(result.all())
         if not records:
             raise RecordNotFoundError(f"listed skill {name}@{version} was not found")
         return records[0]
@@ -523,7 +523,7 @@ class HubRepository:
 
     @staticmethod
     def _listed_skill_statement() -> Select[
-        tuple[SkillVersionModel, AuthorModel, ArtifactModel]
+        SkillVersionModel, AuthorModel, ArtifactModel
     ]:
         return (
             select(SkillVersionModel, AuthorModel, ArtifactModel)
