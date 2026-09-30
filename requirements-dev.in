@@ -7,6 +7,8 @@ pip-audit>=2.7
 cyclonedx-bom>=4.0
 # Floor transitive/build tools above pip-audit advisories
 msgpack>=1.2.1
+urllib3>=2.8.0
+virtualenv>=21.7.13
 
 # pip is deliberately not listed here. It is the installer, not an application
 # dependency, and `pip-compile` treats it as unsafe-to-pin: any regeneration
