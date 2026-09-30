@@ -153,7 +153,7 @@ class ScanRepository:
         self._database = database
 
     @staticmethod
-    def _joined_job() -> Select[tuple[ScanJobModel, SkillVersionModel, ArtifactModel]]:
+    def _joined_job() -> Select[ScanJobModel, SkillVersionModel, ArtifactModel]:
         return (
             select(ScanJobModel, SkillVersionModel, ArtifactModel)
             .join(ArtifactModel, ArtifactModel.id == ScanJobModel.artifact_id)
