@@ -1846,9 +1846,9 @@ uvicorn==0.54.0 \
     --hash=sha256:505bdb0f318731d45f1f712071fc781a8981f6847a31c902c9f5e652d4f67faf \
     --hash=sha256:a2e33cbfaa0306f8e6b0c13e0cb89d7d7a2da3e62b90c66e18c33d9807b28620
     # via -r requirements.txt
-virtualenv==21.15.5 \
-    --hash=sha256:bcf98c32139cf3df7f0cc2c8c48ca150645c20e66f8c4fe6c1e5e40bcae73947 \
-    --hash=sha256:fb869ea32930530ccc87549877b53268c2a4d4a7d7f2c384042eca05170350e6
+virtualenv==21.15.6 \
+    --hash=sha256:4b99ab9b95ff11043939bb4cad2fa0449175fa5a478372864f62160cb6c1a7ed \
+    --hash=sha256:c8b65c7d206ca6ef18de9352c160b3f04f66fff9f6b0ec8fd31f14688eba52c4
     # via
     #   -r requirements-dev.in
     #   pre-commit
