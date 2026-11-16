@@ -25,6 +25,7 @@ anyio==4.15.1 \
     --hash=sha256:9f28306018cbd6d329e64a36d58256edff76dd996fe423bc957326e578b82a94
     # via
     #   -r requirements.txt
+    #   fastapi
     #   httpx
     #   starlette
 arrow==1.4.0 \
@@ -426,9 +427,9 @@ distlib==0.4.3 \
     --hash=sha256:4b0ce306c966eb73bc3a7b6abad017c556dadd92c44701562cd528ac7fde4d5b \
     --hash=sha256:f152097224a0ae24be5a0f6bae1b9359af82133bce63f98a95f86cae1aede9ed
     # via virtualenv
-fastapi==0.162.0 \
-    --hash=sha256:3785963de305dd09912426cb81f2d230fce98ab3521cdfe97265c8d14983128c \
-    --hash=sha256:6a22c1e2e6e32e0633ee7e170f00009a29b8228b16feb219ee42f32fd8d88a8f
+fastapi==0.162.5 \
+    --hash=sha256:1ca37f64f61c99cebd38636e67525fb721c5e8c1169f07f2a35d73b0a63265d4 \
+    --hash=sha256:5303c67415fde762889ca337db79d27b755b8bd09cef314fa7a4340bb30bfd2b
     # via -r requirements.txt
 filelock==4.2.4 \
     --hash=sha256:301241438c57936ef93f4243a94f2559022268bfcf9b375a9a72eb0f8db8358e \
